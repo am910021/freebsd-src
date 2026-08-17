@@ -34,7 +34,11 @@ struct simple_mfd_softc {
 	device_t                dev;
 	struct syscon           *syscon;
 	struct resource         *mem_res;
+	bus_space_tag_t         syscon_bst;
+	bus_space_handle_t      syscon_bsh;
+	bus_size_t              syscon_size;
 	struct mtx              mtx;
+	bool                    syscon_mapped;
 };
 
 DECLARE_CLASS(simple_mfd_driver);

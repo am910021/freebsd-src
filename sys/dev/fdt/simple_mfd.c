@@ -39,6 +39,7 @@
 #include <machine/bus.h>
 
 #include <dev/fdt/simplebus.h>
+#include <dev/fdt/fdt_common.h>
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -54,6 +55,8 @@ struct simplebus_devinfo *simple_mfd_setup_dinfo(device_t dev, phandle_t node,
 #include <dev/extres/syscon/syscon.h>
 
 MALLOC_DECLARE(M_SYSCON);
+
+extern bus_space_tag_t fdtbus_bs_tag;
 
 static uint32_t simple_mfd_syscon_read_4(struct syscon *syscon,
     bus_size_t offset);
@@ -81,15 +84,33 @@ DEFINE_CLASS_1(simple_mfd_syscon, simple_mfd_syscon_class,
     simple_mfd_syscon_methods, 0, syscon_class);
 
 static uint32_t
+simple_mfd_syscon_read(struct simple_mfd_softc *sc, bus_size_t offset)
+{
+
+	if (sc->mem_res != NULL)
+		return (bus_read_4(sc->mem_res, offset));
+	return (bus_space_read_4(sc->syscon_bst, sc->syscon_bsh, offset));
+}
+
+static void
+simple_mfd_syscon_write(struct simple_mfd_softc *sc, bus_size_t offset,
+    uint32_t val)
+{
+
+	if (sc->mem_res != NULL)
+		bus_write_4(sc->mem_res, offset, val);
+	else
+		bus_space_write_4(sc->syscon_bst, sc->syscon_bsh, offset, val);
+}
+
+static uint32_t
 simple_mfd_syscon_read_4(struct syscon *syscon, bus_size_t offset)
 {
 	struct simple_mfd_softc *sc;
-	uint32_t val;
 
 	sc = device_get_softc(syscon->pdev);
 	SYSCON_ASSERT_LOCKED(sc);
-	val = bus_read_4(sc->mem_res, offset);
-	return (val);
+	return (simple_mfd_syscon_read(sc, offset));
 }
 
 static int
@@ -100,7 +121,7 @@ simple_mfd_syscon_write_4(struct syscon *syscon, bus_size_t offset,
 
 	sc = device_get_softc(syscon->pdev);
 	SYSCON_ASSERT_LOCKED(sc);
-	bus_write_4(sc->mem_res, offset, val);
+	simple_mfd_syscon_write(sc, offset, val);
 	return (0);
 }
 
@@ -113,11 +134,48 @@ simple_mfd_syscon_modify_4(struct syscon *syscon, bus_size_t offset,
 
 	sc = device_get_softc(syscon->pdev);
 	SYSCON_ASSERT_LOCKED(sc);
-	val = bus_read_4(sc->mem_res, offset);
+	val = simple_mfd_syscon_read(sc, offset);
 	val &= ~clear_bits;
 	val |= set_bits;
-	bus_write_4(sc->mem_res, offset, val);
+	simple_mfd_syscon_write(sc, offset, val);
 	return (0);
+}
+
+static int
+simple_mfd_map_syscon_reg(device_t dev, struct simple_mfd_softc *sc,
+    phandle_t node)
+{
+	u_long base, size;
+	int error;
+
+	error = fdt_regsize(node, &base, &size);
+	if (error != 0)
+		return (error);
+	error = bus_space_map(fdtbus_bs_tag, base, size, 0, &sc->syscon_bsh);
+	if (error != 0)
+		return (error);
+	sc->syscon_bst = fdtbus_bs_tag;
+	sc->syscon_size = size;
+	sc->syscon_mapped = true;
+	if (bootverbose)
+		device_printf(dev, "mapped syscon reg %#lx-%#lx\n",
+		    base, base + size - 1);
+	return (0);
+}
+
+static int
+simple_mfd_alloc_syscon_mem(device_t dev, struct simple_mfd_softc *sc,
+    phandle_t node)
+{
+	int rid;
+
+	rid = 0;
+	sc->mem_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
+	    RF_ACTIVE);
+	if (sc->mem_res != NULL)
+		return (0);
+
+	return (simple_mfd_map_syscon_reg(dev, sc, node));
 }
 
 static int
@@ -169,13 +227,12 @@ simple_mfd_attach(device_t dev)
 {
 	struct simple_mfd_softc *sc;
 	phandle_t node, child;
-	int rid;
+	int error;
 
 	sc = device_get_softc(dev);
 	node = ofw_bus_get_node(dev);
 
 	sc->dev = dev;
-	rid = 0;
 
 	/* Parse address-cells and size-cells from the parent node as a fallback */
 	if (OF_getencprop(node, "#address-cells", &sc->sc.acells,
@@ -207,11 +264,9 @@ simple_mfd_attach(device_t dev)
 	}
 
 	if (ofw_bus_is_compatible(dev, "syscon")) {
-		sc->mem_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
-		    RF_ACTIVE);
-		if (sc->mem_res == NULL) {
-			device_printf(dev,
-			    "Cannot allocate memory resource\n");
+		error = simple_mfd_alloc_syscon_mem(dev, sc, node);
+		if (error != 0) {
+			device_printf(dev, "Cannot allocate memory resource\n");
 			return (ENXIO);
 		}
 
@@ -244,6 +299,9 @@ simple_mfd_detach(device_t dev)
 		if (sc->mem_res != NULL)
 			bus_release_resource(dev, SYS_RES_MEMORY, 0,
 			    sc->mem_res);
+		if (sc->syscon_mapped)
+			bus_space_unmap(sc->syscon_bst, sc->syscon_bsh,
+			    sc->syscon_size);
 	}
 	return (0);
 }

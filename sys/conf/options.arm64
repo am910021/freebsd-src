@@ -19,6 +19,9 @@ EMUL_SWP			opt_global.h
 # EFI Runtime services support
 EFIRT				opt_efirt.h
 
+# Opt-in word-pair copy for kernels that assume Normal-memory endpoints.
+ARM64_COPYIO_ALIGNED_WORD_PAIR	opt_copyio.h
+
 # SoC Support
 SOC_ALLWINNER_A64		opt_soc.h
 SOC_ALLWINNER_H5		opt_soc.h
@@ -36,4 +39,5 @@ SOC_NXP_LS			opt_soc.h
 SOC_ROCKCHIP_RK3328		opt_soc.h
 SOC_ROCKCHIP_RK3399		opt_soc.h
 SOC_ROCKCHIP_RK3568		opt_soc.h
+SOC_ROCKCHIP_RK3588		opt_soc.h
 SOC_XILINX_ZYNQ			opt_soc.h

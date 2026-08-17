@@ -194,7 +194,6 @@ hym8563_settime(device_t dev, struct timespec *ts)
 		device_printf(sc->dev, "Cannot write time registers: %d\n", rv);
 		return (rv);
 	}
-	return (rv);
 
 	/* Start RTC again */
 	rv = hym8563_write_1(sc, HYM8563_CTRL1, 0);

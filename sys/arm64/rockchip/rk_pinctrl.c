@@ -44,6 +44,7 @@
 
 #include <dev/fdt/simplebus.h>
 
+#include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
@@ -51,101 +52,15 @@
 
 #include <dev/extres/syscon/syscon.h>
 
+#include "opt_soc.h"
+#include "rk_pinctrl.h"
 #include "gpio_if.h"
 #include "syscon_if.h"
 #include "fdt_pinctrl_if.h"
 
-struct rk_pinctrl_pin_drive {
-	uint32_t	bank;
-	uint32_t	subbank;
-	uint32_t	offset;
-	uint32_t	value;
-	uint32_t	ma;
-};
-
-struct rk_pinctrl_bank {
-	uint32_t	bank;
-	uint32_t	subbank;
-	uint32_t	offset;
-	uint32_t	nbits;
-};
-
-struct rk_pinctrl_pin_fixup {
-	uint32_t	bank;
-	uint32_t	subbank;
-	uint32_t	pin;
-	uint32_t	reg;
-	uint32_t	bit;
-	uint32_t	mask;
-};
-
-struct rk_pinctrl_gpio {
-	uint32_t	bank;
-	char		*gpio_name;
-	device_t	gpio_dev;
-};
-
-struct rk_pinctrl_softc;
-
-struct rk_pinctrl_conf {
-	struct rk_pinctrl_bank		*iomux_conf;
-	uint32_t			iomux_nbanks;
-	struct rk_pinctrl_pin_fixup	*pin_fixup;
-	uint32_t			npin_fixup;
-	struct rk_pinctrl_pin_drive	*pin_drive;
-	uint32_t			npin_drive;
-	struct rk_pinctrl_gpio		*gpio_bank;
-	uint32_t			ngpio_bank;
-	uint32_t	(*get_pd_offset)(struct rk_pinctrl_softc *, uint32_t);
-	struct syscon	*(*get_syscon)(struct rk_pinctrl_softc *, uint32_t);
-	int		(*parse_bias)(phandle_t, int);
-	int		(*resolv_bias_value)(int, int);
-	int		(*get_bias_value)(int, int);
-};
-
-struct rk_pinctrl_softc {
-	struct simplebus_softc	simplebus_sc;
-	device_t		dev;
-	struct syscon		*grf;
-	struct syscon		*pmu;
-	struct rk_pinctrl_conf	*conf;
-	struct mtx		mtx;
-};
-
 #define	RK_PINCTRL_LOCK(_sc)		mtx_lock_spin(&(_sc)->mtx)
 #define	RK_PINCTRL_UNLOCK(_sc)		mtx_unlock_spin(&(_sc)->mtx)
 #define	RK_PINCTRL_LOCK_ASSERT(_sc)	mtx_assert(&(_sc)->mtx, MA_OWNED)
-
-#define	RK_IOMUX(_bank, _subbank, _offset, _nbits)			\
-{									\
-	.bank = _bank,							\
-	.subbank = _subbank,						\
-	.offset = _offset,						\
-	.nbits = _nbits,						\
-}
-
-#define	RK_PINFIX(_bank, _pin, _reg, _bit, _mask)			\
-{									\
-	.bank = _bank,							\
-	.pin = _pin,							\
-	.reg = _reg,							\
-	.bit = _bit,							\
-	.mask = _mask,							\
-}
-
-#define	RK_PINDRIVE(_bank, _subbank, _offset, _value, _ma)		\
-{									\
-	.bank = _bank,							\
-	.subbank = _subbank,						\
-	.offset = _offset,						\
-	.value = _value,						\
-	.ma = _ma,							\
-}
-#define	RK_GPIO(_bank, _name)						\
-{									\
-	.bank = _bank,							\
-	.gpio_name = _name,						\
-}
 
 static struct rk_pinctrl_gpio rk3288_gpio_bank[] = {
 	RK_GPIO(0, "gpio0"),
@@ -379,6 +294,10 @@ rk3288_get_syscon(struct rk_pinctrl_softc *sc, uint32_t bank)
 static int
 rk3288_parse_bias(phandle_t node, int bank)
 {
+
+	if (node <= 0)
+		return (-1);
+
 	if (OF_hasprop(node, "bias-disable"))
 		return (0);
 	if (OF_hasprop(node, "bias-pull-up"))
@@ -672,6 +591,9 @@ rk3399_parse_bias(phandle_t node, int bank)
 {
 	int pullup, pulldown;
 
+	if (node <= 0)
+		return (-1);
+
 	if (OF_hasprop(node, "bias-disable"))
 		return (0);
 
@@ -955,6 +877,9 @@ static int
 rk3568_parse_bias(phandle_t node, int bank)
 {
 
+	if (node <= 0)
+		return (-1);
+
 	if (OF_hasprop(node, "bias-disable"))
 		return (0);
 	if (OF_hasprop(node, "bias-pull-up"))
@@ -1000,6 +925,7 @@ struct rk_pinctrl_conf rk3568_conf = {
 	.parse_bias = rk3568_parse_bias,
 	.resolv_bias_value = rk3568_resolv_bias_value,
 	.get_bias_value = rk3568_get_bias_value,
+	.is_rk3568 = true,
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -1007,6 +933,9 @@ static struct ofw_compat_data compat_data[] = {
 	{"rockchip,rk3328-pinctrl", (uintptr_t)&rk3328_conf},
 	{"rockchip,rk3399-pinctrl", (uintptr_t)&rk3399_conf},
 	{"rockchip,rk3568-pinctrl", (uintptr_t)&rk3568_conf},
+#ifdef SOC_ROCKCHIP_RK3588
+	{"rockchip,rk3588-pinctrl", (uintptr_t)&rk3588_pinctrl_conf},
+#endif
 	{NULL,             0}
 };
 
@@ -1137,6 +1066,40 @@ uint32_t pin)
 	return (0);
 }
 
+static bool
+rk_pinctrl_calc_mux(struct rk_pinctrl_softc *sc, struct rk_pinctrl_bank *iomux,
+    uint32_t pin, uint32_t *reg, uint32_t *mask, uint32_t *bit)
+{
+
+	*reg = iomux->offset;
+	switch (iomux->nbits) {
+	case 4:
+		if ((pin % 8) >= 4)
+			*reg += 0x4;
+		*bit = (pin % 4) * 4;
+		*mask = 0xf;
+		break;
+	case 3:
+		if ((pin % 8) >= 5)
+			*reg += 0x4;
+		*bit = (pin % 8 % 5) * 3;
+		*mask = 0x7;
+		break;
+	case 2:
+		*bit = (pin % 8) * 2;
+		*mask = 0x3;
+		break;
+	default:
+		device_printf(sc->dev,
+		    "Unknown pin stride width %d in bank %d\n",
+		    iomux->nbits, iomux->bank);
+		return (false);
+	}
+
+	rk_pinctrl_get_fixup(sc, iomux->bank, pin, reg, mask, bit);
+	return (true);
+}
+
 static void
 rk_pinctrl_configure_pin(struct rk_pinctrl_softc *sc, uint32_t *pindata)
 {
@@ -1145,6 +1108,11 @@ rk_pinctrl_configure_pin(struct rk_pinctrl_softc *sc, uint32_t *pindata)
 	uint32_t bank, subbank, pin, function;
 	uint32_t bit, mask, reg, drive;
 	int i, rv, bias;
+
+	if (sc->conf->configure_pin != NULL) {
+		sc->conf->configure_pin(sc, pindata);
+		return;
+	}
 
 	bank = pindata[0];
 	pin = pindata[1];
@@ -1167,7 +1135,8 @@ rk_pinctrl_configure_pin(struct rk_pinctrl_softc *sc, uint32_t *pindata)
 	syscon = sc->conf->get_syscon(sc, bank);
 
 	/* Setup GPIO properties first */
-	rv = rk_pinctrl_handle_io(sc, pin_conf, bank, pin);
+	if (pin_conf > 0)
+		rv = rk_pinctrl_handle_io(sc, pin_conf, bank, pin);
 
 	/* Then pin pull-up/down */
 	bias = sc->conf->parse_bias(pin_conf, bank);
@@ -1176,29 +1145,29 @@ rk_pinctrl_configure_pin(struct rk_pinctrl_softc *sc, uint32_t *pindata)
 		reg += bank * 0x10 + ((pin / 8) * 0x4);
 		bit = (pin % 8) * 2;
 		mask = (0x3 << bit);
-		SYSCON_MODIFY_4(syscon, reg, mask, bias << bit | (mask << 16));
+		SYSCON_MODIFY_4(syscon, reg, mask,
+		    bias << bit | (mask << 16));
 	}
 
 	/* Then drive strength */
-	if (ofw_bus_node_is_compatible(ofw_bus_get_node(sc->dev),
-	    "rockchip,rk3568-pinctrl")) {
+	if (sc->conf->is_rk3568) {
 		uint32_t value;
-		if (OF_getencprop(pin_conf, "drive-strength", &value,
+		if (pin_conf > 0 &&
+		    OF_getencprop(pin_conf, "drive-strength", &value,
 		    sizeof(value)) == 0) {
 			if (bank)
-				reg = 0x01c0 + (bank * 0x40) + (pin / 2 * 4);
+				reg = 0x01c0 + (bank * 0x40) +
+				    (pin / 2 * 4);
 			else
 				reg = 0x0070 + (pin / 2 * 4);
 
 			drive = ((1 << (value + 1)) - 1) << (pin % 2);
-
 			mask = 0x3f << (pin % 2);
-
 			SYSCON_WRITE_4(syscon, reg, drive | (mask << 16));
 		}
 	} else {
-		rv = rk_pinctrl_parse_drive(sc, pin_conf, bank, subbank, &drive,
-		    &reg);
+		rv = rk_pinctrl_parse_drive(sc, pin_conf, bank,
+		    subbank, &drive, &reg);
 		if (rv == 0) {
 			bit = (pin % 8) * 2;
 			mask = (0x3 << bit);
@@ -1208,31 +1177,9 @@ rk_pinctrl_configure_pin(struct rk_pinctrl_softc *sc, uint32_t *pindata)
 	}
 
 	/* Finally set the pin function */
-	reg = sc->conf->iomux_conf[i].offset;
-	switch (sc->conf->iomux_conf[i].nbits) {
-	case 4:
-		if ((pin % 8) >= 4)
-			reg += 0x4;
-		bit = (pin % 4) * 4;
-		mask = (0xF << bit);
-		break;
-	case 3:
-		if ((pin % 8) >= 5)
-			reg += 4;
-		bit = (pin % 8 % 5) * 3;
-		mask = (0x7 << bit);
-		break;
-	case 2:
-		bit = (pin % 8) * 2;
-		mask = (0x3 << bit);
-		break;
-	default:
-		device_printf(sc->dev,
-		    "Unknown pin stride width %d in bank %d\n",
-		    sc->conf->iomux_conf[i].nbits, bank);
+	if (!rk_pinctrl_calc_mux(sc, &sc->conf->iomux_conf[i], pin, &reg,
+	    &mask, &bit))
 		return;
-	}
-	rk_pinctrl_get_fixup(sc, bank, pin, &reg, &mask, &bit);
 
 	/*
 	 * NOTE: not all syscon registers uses hi-word write mask, thus
@@ -1240,11 +1187,11 @@ rk_pinctrl_configure_pin(struct rk_pinctrl_softc *sc, uint32_t *pindata)
 	 * XXXX We should not pass write mask to syscon register 
 	 * without hi-word write mask.
 	 */
-	SYSCON_MODIFY_4(syscon, reg, mask, function << bit | (mask << 16));
+	SYSCON_MODIFY_4(syscon, reg, mask << bit,
+	    function << bit | (mask << (bit + 16)));
 
 	/* RK3568 specific pin mux for various functionalities */
-	if (ofw_bus_node_is_compatible(ofw_bus_get_node(sc->dev),
-	    "rockchip,rk3568-pinctrl")) {
+	if (sc->conf->is_rk3568) {
 		if (bank == 3 && pin == 9 && function == 3)
 			SYSCON_WRITE_4(sc->grf,
 			    GRF_IOFUNC_SEL0, GMAC1_IOMUX_SEL_M0);
@@ -1285,6 +1232,9 @@ rk_pinctrl_is_gpio_locked(struct rk_pinctrl_softc *sc, struct syscon *syscon,
 	int i;
 
 	RK_PINCTRL_LOCK_ASSERT(sc);
+
+	if (sc->conf->is_gpio != NULL)
+		return (sc->conf->is_gpio(sc, syscon, bank, pin, is_gpio));
 
 	subbank = pin / 8;
 	*is_gpio = false;
@@ -1404,6 +1354,11 @@ rk_pinctrl_get_flags(device_t pinctrl, device_t gpio, uint32_t pin,
 		rv = EINVAL;
 		goto done;
 	}
+	if (sc->conf->get_flags != NULL) {
+		rv = sc->conf->get_flags(sc, syscon, bank, pin, flags);
+		goto done;
+	}
+
 	/* Get the pullup/pulldown configuration */
 	reg = sc->conf->get_pd_offset(sc, bank);
 	reg += bank * 0x10 + ((pin / 8) * 0x4);
@@ -1444,6 +1399,11 @@ rk_pinctrl_set_flags(device_t pinctrl, device_t gpio, uint32_t pin,
 		rv = EINVAL;
 		goto done;
 	}
+	if (sc->conf->set_flags != NULL) {
+		rv = sc->conf->set_flags(sc, syscon, bank, pin, flags);
+		goto done;
+	}
+
 	/* Get the pullup/pulldown configuration */
 	reg = sc->conf->get_pd_offset(sc, bank);
 	reg += bank * 0x10 + ((pin / 8) * 0x4);
@@ -1485,8 +1445,8 @@ rk_pinctrl_attach(device_t dev)
 	node = ofw_bus_get_node(dev);
 
 	if (OF_hasprop(node, "rockchip,grf") &&
-	    syscon_get_by_ofw_property(dev, node,
-	    "rockchip,grf", &sc->grf) != 0) {
+	    syscon_get_by_ofw_property(dev, node, "rockchip,grf",
+	    &sc->grf) != 0) {
 		device_printf(dev, "cannot get grf driver handle\n");
 		return (ENXIO);
 	}
@@ -1525,6 +1485,12 @@ rk_pinctrl_attach(device_t dev)
 			gpio_unit += 1;
 			continue;
 		}
+		/*
+		 * Preserve the child pointer even if the first synchronous
+		 * attach attempt defers; later newbus retries reuse the same
+		 * device_t and rk_pinctrl_get_bank() needs a stable match.
+		 */
+		sc->conf->gpio_bank[gpio_unit].gpio_dev = cdev;
 		rv = device_probe_and_attach(cdev);
 		if (rv != 0) {
 			device_printf(sc->dev,
@@ -1532,7 +1498,6 @@ rk_pinctrl_attach(device_t dev)
 			gpio_unit += 1;
 			continue;
 		}
-		sc->conf->gpio_bank[gpio_unit].gpio_dev = cdev;
 		gpio_unit += 1;
 	}
 
@@ -1567,5 +1532,5 @@ DEFINE_CLASS_1(rk_pinctrl, rk_pinctrl_driver, rk_pinctrl_methods,
     sizeof(struct rk_pinctrl_softc), simplebus_driver);
 
 EARLY_DRIVER_MODULE(rk_pinctrl, simplebus, rk_pinctrl_driver, 0, 0,
-    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE);
+    BUS_PASS_BUS + BUS_PASS_ORDER_FIRST);
 MODULE_VERSION(rk_pinctrl, 1);

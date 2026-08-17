@@ -23,6 +23,7 @@
  * SUCH DAMAGE.
  */
 
+#include "opt_mlx5.h"
 #include "opt_rss.h"
 #include "opt_ratelimit.h"
 
@@ -30,18 +31,42 @@
 #include <netinet/ip_var.h>
 #include <machine/in_cksum.h>
 
-static inline int
-mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq,
-    struct mlx5e_rx_wqe *wqe, u16 ix)
+static inline struct mlx5e_rq_mbuf_slot *
+mlx5e_rx_slot(struct mlx5e_rq *rq, u16 ix)
 {
-	bus_dma_segment_t segs[MLX5E_MAX_BUSDMA_RX_SEGS];
+
+	return (&rq->mbuf[ix].slot[rq->mbuf[ix].active]);
+}
+
+static inline void
+mlx5e_set_rx_wqe(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe,
+    struct mlx5e_rq_mbuf_slot *slot)
+{
+	int i;
+
+	wqe->data[0].addr = cpu_to_be64(slot->segs[0].ds_addr);
+	wqe->data[0].byte_count = cpu_to_be32(slot->segs[0].ds_len |
+	    MLX5_HW_START_PADDING);
+	for (i = 1; i != slot->nsegs; i++) {
+		wqe->data[i].addr = cpu_to_be64(slot->segs[i].ds_addr);
+		wqe->data[i].byte_count = cpu_to_be32(slot->segs[i].ds_len);
+	}
+	for (; i < rq->nsegs; i++) {
+		wqe->data[i].addr = 0;
+		wqe->data[i].byte_count = 0;
+	}
+}
+
+static inline int
+mlx5e_alloc_rx_slot(struct mlx5e_rq *rq,
+    struct mlx5e_rq_mbuf_slot *slot)
+{
 	struct mbuf *mb;
-	int nsegs;
 	int err;
 	struct mbuf *mb_head;
 	int i;
 
-	if (rq->mbuf[ix].mbuf != NULL)
+	if (slot->mbuf != NULL)
 		return (0);
 
 	mb_head = mb = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, rq->wqe_sz);
@@ -66,38 +91,74 @@ mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq,
 	/* get IP header aligned */
 	m_adj(mb, MLX5E_NET_IP_ALIGN);
 
-	err = -bus_dmamap_load_mbuf_sg(rq->dma_tag, rq->mbuf[ix].dma_map,
-	    mb, segs, &nsegs, BUS_DMA_NOWAIT);
+	err = -bus_dmamap_load_mbuf_sg(rq->dma_tag, slot->dma_map,
+	    mb, slot->segs, &slot->nsegs, BUS_DMA_NOWAIT);
 	if (err != 0)
 		goto err_free_mbuf;
-	if (unlikely(nsegs == 0)) {
-		bus_dmamap_unload(rq->dma_tag, rq->mbuf[ix].dma_map);
+	if (unlikely(slot->nsegs == 0)) {
+		bus_dmamap_unload(rq->dma_tag, slot->dma_map);
 		err = -ENOMEM;
 		goto err_free_mbuf;
 	}
-	wqe->data[0].addr = cpu_to_be64(segs[0].ds_addr);
-	wqe->data[0].byte_count = cpu_to_be32(segs[0].ds_len |
-	    MLX5_HW_START_PADDING);
-	for (i = 1; i != nsegs; i++) {
-		wqe->data[i].addr = cpu_to_be64(segs[i].ds_addr);
-		wqe->data[i].byte_count = cpu_to_be32(segs[i].ds_len);
-	}
-	for (; i < rq->nsegs; i++) {
-		wqe->data[i].addr = 0;
-		wqe->data[i].byte_count = 0;
-	}
 
-	rq->mbuf[ix].mbuf = mb;
-	rq->mbuf[ix].data = mb->m_data;
-
-	bus_dmamap_sync(rq->dma_tag, rq->mbuf[ix].dma_map,
-	    BUS_DMASYNC_PREREAD);
+	slot->mbuf = mb;
+	slot->data = mb->m_data;
 	return (0);
 
 err_free_mbuf:
+	slot->nsegs = 0;
 	m_freem(mb);
 	return (err);
 }
+
+static inline int
+mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq,
+    struct mlx5e_rx_wqe *wqe, u16 ix)
+{
+	struct mlx5e_rq_mbuf_slot *slot;
+	int error;
+
+	slot = mlx5e_rx_slot(rq, ix);
+	error = mlx5e_alloc_rx_slot(rq, slot);
+	if (error != 0)
+		return (error);
+	mlx5e_set_rx_wqe(rq, wqe, slot);
+	bus_dmamap_sync(rq->dma_tag, slot->dma_map, BUS_DMASYNC_PREREAD);
+	return (0);
+}
+
+#ifdef MLX5E_RX_MAPPED_SLOTS
+static inline bool
+mlx5e_rx_slot_idle(struct mlx5e_rq_mbuf_slot *slot)
+{
+	struct mbuf *mb;
+
+	for (mb = slot->mbuf; mb != NULL; mb = mb->m_next) {
+		if (!M_WRITABLE(mb))
+			return (false);
+	}
+	return (slot->mbuf != NULL);
+}
+
+static inline struct mbuf *
+mlx5e_rx_shadow(struct mlx5e_rq *rq, u16 ix, u32 byte_cnt)
+{
+	struct mlx5e_rq_mbuf *rm;
+	struct mlx5e_rq_mbuf_slot *cur_slot, *next_slot;
+	struct mbuf *mb;
+
+	rm = &rq->mbuf[ix];
+	cur_slot = &rm->slot[rm->active];
+	next_slot = &rm->slot[rm->active ^ 1];
+	if (mlx5e_alloc_rx_slot(rq, next_slot) != 0 ||
+	    !mlx5e_rx_slot_idle(next_slot))
+		return (NULL);
+	mb = m_copym(cur_slot->mbuf, 0, byte_cnt, M_NOWAIT);
+	if (mb != NULL)
+		rm->active ^= 1;
+	return (mb);
+}
+#endif
 
 static void
 mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
@@ -547,6 +608,7 @@ mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 	CURVNET_SET_QUIET(if_getvnet(rq->ifp));
 	pfil = rq->channel->priv->pfil;
 	for (i = 0; i < budget; i++) {
+		struct mlx5e_rq_mbuf_slot *slot;
 		struct mlx5e_rx_wqe *wqe;
 		struct mlx5_cqe64 *cqe;
 		struct mbuf *mb;
@@ -567,9 +629,9 @@ mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 		wqe_counter = be16_to_cpu(wqe_counter_be);
 		wqe = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
 		byte_cnt = be32_to_cpu(cqe->byte_cnt);
+		slot = mlx5e_rx_slot(rq, wqe_counter);
 
-		bus_dmamap_sync(rq->dma_tag,
-		    rq->mbuf[wqe_counter].dma_map,
+		bus_dmamap_sync(rq->dma_tag, slot->dma_map,
 		    BUS_DMASYNC_POSTREAD);
 
 		if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
@@ -580,7 +642,7 @@ mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 		if (pfil != NULL && PFIL_HOOKED_IN(pfil)) {
 			seglen = MIN(byte_cnt, MLX5E_MAX_RX_BYTES);
 			rv = pfil_mem_in(rq->channel->priv->pfil,
-			    rq->mbuf[wqe_counter].data, seglen, rq->ifp, &mb);
+			    slot->data, seglen, rq->ifp, &mb);
 
 			switch (rv) {
 			case PFIL_DROPPED:
@@ -615,14 +677,30 @@ mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 			/* get IP header aligned */
 			mb->m_data += MLX5E_NET_IP_ALIGN;
 
-			bcopy(rq->mbuf[wqe_counter].data, mtod(mb, caddr_t),
+			bcopy(slot->data, mtod(mb, caddr_t),
 			    byte_cnt);
+#ifdef MLX5E_RX_MAPPED_SLOTS
+		} else if ((mb = mlx5e_rx_shadow(rq, wqe_counter,
+		    byte_cnt)) != NULL) {
+			/* The alternate mapped slot is posted while the stack owns this one. */
+			rq->stats.mapped_shadow++;
+		} else if (byte_cnt <= MJUM9BYTES - MLX5E_NET_IP_ALIGN &&
+		    (mb = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR,
+		    MJUM9BYTES)) != NULL) {
+			/* Both mapped slots are busy; retain V2188's safe copy fallback. */
+			mb->m_data += MLX5E_NET_IP_ALIGN;
+			mb->m_len = MJUM9BYTES - MLX5E_NET_IP_ALIGN;
+			m_copydata(slot->mbuf, 0, byte_cnt,
+			    mtod(mb, caddr_t));
+			rq->stats.mapped_copy++;
+#endif
 		} else {
-			mb = rq->mbuf[wqe_counter].mbuf;
-			rq->mbuf[wqe_counter].mbuf = NULL;	/* safety clear */
+			mb = slot->mbuf;
+			slot->mbuf = NULL;	/* safety clear */
+			slot->data = NULL;
+			slot->nsegs = 0;
 
-			bus_dmamap_unload(rq->dma_tag,
-			    rq->mbuf[wqe_counter].dma_map);
+			bus_dmamap_unload(rq->dma_tag, slot->dma_map);
 		}
 rx_common:
 		mlx5e_build_rx_mbuf(cqe, rq, mb, byte_cnt);

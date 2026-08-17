@@ -50,6 +50,7 @@
 
 static int rk_clk_gate_init(struct clknode *clk, device_t dev);
 static int rk_clk_gate_set_gate(struct clknode *clk, bool enable);
+
 struct rk_clk_gate_sc {
 	uint32_t	offset;
 	uint32_t	shift;
@@ -91,21 +92,27 @@ rk_clk_gate_init(struct clknode *clk, device_t dev)
 static int
 rk_clk_gate_set_gate(struct clknode *clk, bool enable)
 {
-	uint32_t reg;
+	uint32_t val, write_val;
 	struct rk_clk_gate_sc *sc;
 	int rv;
 
 	sc = clknode_get_softc(clk);
 	sc->ungated = enable;
+	val = (sc->ungated ? sc->on_value : sc->off_value) & sc->mask;
 	DEVICE_LOCK(clk);
-	rv = MD4(clk, sc->offset, sc->mask << sc->shift,
-	    ((sc->ungated ? sc->on_value : sc->off_value) << sc->shift) |
-	    RK_CLK_GATE_MASK);
+	if ((sc->gate_flags & RK_CLK_GATE_HIWORD_MASK) != 0) {
+		write_val = (sc->mask << (sc->shift + 16)) |
+		    (val << sc->shift);
+		rv = WR4(clk, sc->offset, write_val);
+	} else {
+		write_val = (val << sc->shift) | RK_CLK_GATE_MASK;
+		rv = MD4(clk, sc->offset, sc->mask << sc->shift,
+		    write_val);
+	}
 	if (rv != 0) {
 		DEVICE_UNLOCK(clk);
 		return (rv);
 	}
-	RD4(clk, sc->offset, &reg);
 	DEVICE_UNLOCK(clk);
 	return(0);
 }

@@ -40,7 +40,9 @@ struct rk_clk_gate_def {
 	int			gate_flags;
 };
 
-#define	RK_CLK_GATE_MASK	0xFFFF0000
+#define	RK_CLK_GATE_MASK		0xFFFF0000
+#define	RK_CLK_GATE_HIWORD_MASK		(1 << 0)
+#define	RK_CLK_GATE_SET_TO_DISABLE	(1 << 1)
 
 int rk_clk_gate_register(struct clkdom *clkdom, struct rk_clk_gate_def *clkdef);
 

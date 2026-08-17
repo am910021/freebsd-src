@@ -944,6 +944,7 @@ SDP_DEBUG	opt_ofed.h
 IPOIB		opt_ofed.h
 IPOIB_DEBUG	opt_ofed.h
 IPOIB_CM	opt_ofed.h
+MLX5E_RX_MAPPED_SLOTS	opt_mlx5.h
 
 # Resource Accounting
 RACCT		opt_global.h

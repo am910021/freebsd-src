@@ -959,8 +959,10 @@ usb_bus_mem_alloc_all(struct usb_bus *bus, bus_dma_tag_t dmat,
 	TAILQ_INIT(&bus->intr_q.head);
 
 #if USB_HAVE_BUSDMA
+	bus->dma_xfer_alloc_mode = USB_DMA_ALLOC_STREAMING;
 	usb_dma_tag_setup(bus->dma_parent_tag, bus->dma_tags,
-	    dmat, &bus->bus_mtx, NULL, bus->dma_bits, USB_BUS_DMA_TAG_MAX);
+	    dmat, &bus->bus_mtx, NULL, bus->dma_bits, USB_BUS_DMA_TAG_MAX,
+	    USB_DMA_ALLOC_COHERENT);
 #endif
 	if ((bus->devices_max > USB_MAX_DEVICES) ||
 	    (bus->devices_max < USB_MIN_DEVICES) ||

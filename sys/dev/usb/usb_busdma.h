@@ -41,6 +41,10 @@
 
 #define	USB_GET_DMA_TAG(dev) bus_get_dma_tag(dev)
 
+#define	USB_DMA_ALLOC_COHERENT	0
+#define	USB_DMA_ALLOC_STREAMING	1
+#define	USB_DMA_ALLOC_STREAMING_PAYLOAD	2
+
 /* structure prototypes */
 
 struct usb_xfer_root;
@@ -114,6 +118,7 @@ struct usb_dma_parent_tag {
 	uint8_t	dma_error;		/* set if DMA load operation failed */
 	uint8_t	dma_bits;		/* number of DMA address lines */
 	uint8_t	utag_max;		/* number of USB DMA tags */
+	uint8_t	alloc_mode;		/* USB_DMA_ALLOC_* */
 };
 #else
 struct usb_dma_parent_tag {};		/* empty struct */
@@ -150,7 +155,8 @@ void	usb_bdma_pre_sync(struct usb_xfer *xfer);
 void	usb_bdma_work_loop(struct usb_xfer_queue *pq);
 void	usb_dma_tag_setup(struct usb_dma_parent_tag *udpt,
 	    struct usb_dma_tag *udt, bus_dma_tag_t dmat, struct mtx *mtx,
-	    usb_dma_callback_t *func, uint8_t ndmabits, uint8_t nudt);
+	    usb_dma_callback_t *func, uint8_t ndmabits, uint8_t nudt,
+	    uint8_t alloc_mode);
 void	usb_dma_tag_unsetup(struct usb_dma_parent_tag *udpt);
 void	usb_pc_cpu_flush(struct usb_page_cache *pc);
 void	usb_pc_cpu_invalidate(struct usb_page_cache *pc);

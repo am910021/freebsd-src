@@ -112,8 +112,11 @@
 #include <dev/pci/pcivar.h>
 #include <dev/iommu/iommu.h>
 #include <arm64/iommu/iommu_pmap.h>
+#include <arm64/iommu/smmu_soc.h>
 
 #include <machine/bus.h>
+#include <machine/cpufunc.h>
+#include <machine/pmap.h>
 
 #ifdef FDT
 #include <dev/fdt/fdt_common.h>
@@ -162,6 +165,64 @@ static struct resource_spec smmu_spec[] = {
 MALLOC_DEFINE(M_SMMU, "SMMU", SMMU_DEVSTR);
 
 #define	dprintf(fmt, ...)
+
+SYSCTL_NODE(_hw, OID_AUTO, smmu, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "ARM SMMU diagnostics");
+
+static void
+smmu_cache_wb(struct smmu_softc *sc, void *addr, vm_size_t size)
+{
+
+	if (sc->features & SMMU_FEATURE_COHERENCY)
+		return;
+
+	cpu_dcache_wb_range((vm_offset_t)addr, size);
+	dsb(sy);
+}
+
+static vm_memattr_t
+smmu_dma_memattr_default(vm_memattr_t memattr)
+{
+
+	if (memattr == VM_MEMATTR_DEVICE || memattr == VM_MEMATTR_DEVICE_NP)
+		return (memattr);
+
+	return (VM_MEMATTR_UNCACHEABLE);
+}
+
+static vm_memattr_t
+smmu_dma_memattr_policy(vm_memattr_t memattr, int policy)
+{
+
+	if (memattr == VM_MEMATTR_DEVICE || memattr == VM_MEMATTR_DEVICE_NP)
+		return (memattr);
+
+	switch (policy) {
+	case SMMU_DMA_MEMATTR_PRESERVE:
+		return (memattr);
+	case SMMU_DMA_MEMATTR_DEVICE:
+		return (VM_MEMATTR_DEVICE);
+	case SMMU_DMA_MEMATTR_NORMAL_NC:
+	default:
+		return (VM_MEMATTR_UNCACHEABLE);
+	}
+}
+
+static vm_memattr_t
+smmu_dma_memattr(struct smmu_softc *sc, vm_memattr_t memattr)
+{
+	int policy;
+
+	/*
+	 * Keep the policy decision out of smmu_map().  The generic SMMU path is
+	 * still the default; FDT SoC code can install a stricter non-coherent
+	 * DMA policy from the front-end attachment code.
+	 */
+	policy = smmu_soc_dma_memattr_policy(sc->dev, sc->dma_memattr_policy);
+	if (policy == SMMU_DMA_MEMATTR_GENERIC)
+		return (smmu_dma_memattr_default(memattr));
+	return (smmu_dma_memattr_policy(memattr, policy));
+}
 
 struct smmu_event {
 	int ident;
@@ -246,7 +307,7 @@ smmu_q_empty(struct smmu_queue *q)
 	return (0);
 }
 
-static int __unused
+static int
 smmu_q_consumed(struct smmu_queue *q, uint32_t prod)
 {
 
@@ -284,6 +345,19 @@ smmu_q_inc_prod(struct smmu_queue *q)
 
 	return (val);
 }
+
+static uint32_t
+smmu_q_inc_prod_val(struct smmu_queue *q, uint32_t prodval)
+{
+	uint32_t prod;
+	uint32_t val;
+
+	prod = (Q_WRP(q, prodval) | Q_IDX(q, prodval)) + 1;
+	val = (Q_OVF(prodval) | Q_WRP(q, prod) | Q_IDX(q, prod));
+
+	return (val);
+}
+
 
 static int
 smmu_write_ack(struct smmu_softc *sc, uint32_t reg,
@@ -329,6 +403,7 @@ smmu_init_queue(struct smmu_softc *sc, struct smmu_queue *q,
 	q->prod_off = prod_off;
 	q->cons_off = cons_off;
 	q->paddr = vtophys(q->vaddr);
+	smmu_cache_wb(sc, q->vaddr, sz);
 
 	q->base = CMDQ_BASE_RA | EVENTQ_BASE_WA | PRIQ_BASE_WA;
 	q->base |= q->paddr & Q_BASE_ADDR_M;
@@ -459,6 +534,9 @@ smmu_print_event(struct smmu_softc *sc, uint32_t *evt)
 		return;
 	}
 
+	if (!smmu_soc_event_record(sc->dev, event_id, sid, input_addr))
+		return;
+
 	if (ev) {
 		device_printf(sc->dev,
 		    "Event %s (%s) received.\n", ev->str, ev->msg);
@@ -484,8 +562,13 @@ make_cmd(struct smmu_softc *sc, uint64_t *cmd,
 
 	switch (entry->opcode) {
 	case CMD_TLBI_NH_VA:
+		cmd[0] |= (uint64_t)entry->tlbi.num << TLBI_0_NUM_S;
+		cmd[0] |= (uint64_t)entry->tlbi.scale << TLBI_0_SCALE_S;
+		cmd[0] |= (uint64_t)entry->tlbi.vmid << TLBI_0_VMID_S;
 		cmd[0] |= (uint64_t)entry->tlbi.asid << TLBI_0_ASID_S;
 		cmd[1] = entry->tlbi.addr & TLBI_1_ADDR_M;
+		cmd[1] |= (uint64_t)entry->tlbi.ttl << TLBI_1_TTL_S;
+		cmd[1] |= (uint64_t)entry->tlbi.tg << TLBI_1_TG_S;
 		if (entry->tlbi.leaf) {
 			/*
 			 * Leaf flag means that only cached entries
@@ -527,7 +610,8 @@ make_cmd(struct smmu_softc *sc, uint64_t *cmd,
 }
 
 static void
-smmu_cmdq_enqueue_cmd(struct smmu_softc *sc, struct smmu_cmdq_entry *entry)
+smmu_cmdq_enqueue_cmd_locked(struct smmu_softc *sc,
+    struct smmu_cmdq_entry *entry)
 {
 	uint64_t cmd[CMDQ_ENTRY_DWORDS];
 	struct smmu_queue *cmdq;
@@ -536,8 +620,6 @@ smmu_cmdq_enqueue_cmd(struct smmu_softc *sc, struct smmu_cmdq_entry *entry)
 	cmdq = &sc->cmdq;
 
 	make_cmd(sc, cmd, entry);
-
-	SMMU_LOCK(sc);
 
 	/* Ensure that a space is available. */
 	do {
@@ -548,11 +630,21 @@ smmu_cmdq_enqueue_cmd(struct smmu_softc *sc, struct smmu_cmdq_entry *entry)
 	entry_addr = (void *)((uint64_t)cmdq->vaddr +
 	    Q_IDX(cmdq, cmdq->lc.prod) * CMDQ_ENTRY_DWORDS * 8);
 	memcpy(entry_addr, cmd, CMDQ_ENTRY_DWORDS * 8);
+	smmu_cache_wb(sc, entry_addr, CMDQ_ENTRY_DWORDS * 8);
+
+	dsb(sy);
 
 	/* Increment prod index. */
 	cmdq->lc.prod = smmu_q_inc_prod(cmdq);
 	bus_write_4(sc->res[0], cmdq->prod_off, cmdq->lc.prod);
+}
 
+static void
+smmu_cmdq_enqueue_cmd(struct smmu_softc *sc, struct smmu_cmdq_entry *entry)
+{
+
+	SMMU_LOCK(sc);
+	smmu_cmdq_enqueue_cmd_locked(sc, entry);
 	SMMU_UNLOCK(sc);
 }
 
@@ -569,44 +661,59 @@ smmu_poll_until_consumed(struct smmu_softc *sc, struct smmu_queue *q)
 }
 
 static int
+smmu_sync_poll_consumed(struct smmu_softc *sc, uint32_t target)
+{
+	struct smmu_queue *q;
+	uint32_t cr0;
+	uint32_t cr0ack;
+	uint32_t gerror;
+	uint32_t gerrorn;
+	uint32_t hwcons;
+	uint32_t hwprod;
+	uint32_t cerr;
+	int timeout;
+
+	q = &sc->cmdq;
+	timeout = 1000000;
+
+	do {
+		q->lc.cons = bus_read_4(sc->res[0], q->cons_off);
+		if (smmu_q_consumed(q, target))
+			return (0);
+		cpu_spinwait();
+	} while (timeout--);
+
+	hwprod = bus_read_4(sc->res[0], SMMU_CMDQ_PROD);
+	hwcons = bus_read_4(sc->res[0], SMMU_CMDQ_CONS);
+	cr0 = bus_read_4(sc->res[0], SMMU_CR0);
+	cr0ack = bus_read_4(sc->res[0], SMMU_CR0ACK);
+	gerror = bus_read_4(sc->res[0], SMMU_GERROR);
+	gerrorn = bus_read_4(sc->res[0], SMMU_GERRORN);
+	cerr = (hwcons & CMDQ_CONS_ERR_M) >> CMDQ_CONS_ERR_S;
+	smmu_soc_sync_timeout(sc->dev, target, q->lc.prod, q->lc.cons,
+	    hwprod, hwcons, cerr, cr0, cr0ack, gerror, gerrorn);
+	return (0);
+}
+
+static int
 smmu_sync(struct smmu_softc *sc)
 {
 	struct smmu_cmdq_entry cmd;
 	struct smmu_queue *q;
-	uint32_t *base;
-	int timeout;
 	int prod;
 
 	q = &sc->cmdq;
 	prod = q->lc.prod;
 
-	/* Enqueue sync command. */
-	cmd.opcode = CMD_SYNC;
-	cmd.sync.msiaddr = q->paddr + Q_IDX(q, prod) * CMDQ_ENTRY_DWORDS * 8;
-	smmu_cmdq_enqueue_cmd(sc, &cmd);
-
-	/* Wait for the sync completion. */
-	base = (void *)((uint64_t)q->vaddr +
-	    Q_IDX(q, prod) * CMDQ_ENTRY_DWORDS * 8);
-
 	/*
-	 * It takes around 200 loops (6 instructions each)
-	 * on Neoverse N1 to complete the sync.
+	 * Follow Linux's non-MSIPOLL path for CMD_SYNC.  Some FDT SMMU paths
+	 * advertise no SEV feature but still need CMD_SYNC without MSI
+	 * writeback and a consumer-pointer poll.
 	 */
-	timeout = 10000;
-
-	do {
-		if (*base == 0) {
-			/* MSI write completed. */
-			break;
-		}
-		cpu_spinwait();
-	} while (timeout--);
-
-	if (timeout < 0)
-		device_printf(sc->dev, "Failed to sync\n");
-
-	return (0);
+	cmd.opcode = CMD_SYNC;
+	cmd.sync.msiaddr = 0;
+	smmu_cmdq_enqueue_cmd(sc, &cmd);
+	return (smmu_sync_poll_consumed(sc, smmu_q_inc_prod_val(q, prod)));
 }
 
 static int
@@ -662,6 +769,7 @@ smmu_tlbi_va(struct smmu_softc *sc, vm_offset_t va, uint16_t asid)
 {
 	struct smmu_cmdq_entry cmd;
 
+	memset(&cmd, 0, sizeof(cmd));
 	/* Invalidate specific range */
 	cmd.opcode = CMD_TLBI_NH_VA;
 	cmd.tlbi.asid = asid;
@@ -669,6 +777,76 @@ smmu_tlbi_va(struct smmu_softc *sc, vm_offset_t va, uint16_t asid)
 	cmd.tlbi.leaf = true; /* We change only L3. */
 	cmd.tlbi.addr = va;
 	smmu_cmdq_enqueue_cmd(sc, &cmd);
+}
+
+static int
+smmu_tlbi_va_range_sync(struct smmu_softc *sc, vm_offset_t va,
+    bus_size_t size, uint16_t asid)
+{
+	struct smmu_cmdq_entry cmd;
+	struct smmu_queue *q;
+	u_long inv_pages;
+	u_long num;
+	u_long num_pages;
+	u_long scale;
+	uint32_t target;
+	bool use_range;
+
+	if (size == 0)
+		return (0);
+
+	q = &sc->cmdq;
+	num_pages = size >> PAGE_SHIFT;
+	use_range = smmu_soc_range_tlbi_enabled(sc->dev, sc->features) &&
+	    (sc->features & SMMU_FEATURE_RANGE_INV) != 0;
+
+	SMMU_LOCK(sc);
+	while (num_pages > 0) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opcode = CMD_TLBI_NH_VA;
+		cmd.tlbi.asid = asid;
+		cmd.tlbi.vmid = 0;
+		cmd.tlbi.leaf = true;
+		cmd.tlbi.addr = va;
+		if (use_range) {
+			scale = __builtin_ctzl(num_pages);
+			if (scale > 31)
+				scale = 31;
+			num = (num_pages >> scale) & 31;
+			if (num == 0)
+				num = 1;
+			cmd.tlbi.scale = scale;
+			cmd.tlbi.num = num - 1;
+			cmd.tlbi.ttl = 3;	/* 4KB leaf level. */
+			cmd.tlbi.tg = 1;		/* 4KB translation granule. */
+			inv_pages = num << scale;
+		} else {
+			inv_pages = 1;
+		}
+		smmu_cmdq_enqueue_cmd_locked(sc, &cmd);
+		va += inv_pages << PAGE_SHIFT;
+		num_pages -= inv_pages;
+	}
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = CMD_SYNC;
+	cmd.sync.msiaddr = 0;
+	target = smmu_q_inc_prod_val(q, q->lc.prod);
+	smmu_cmdq_enqueue_cmd_locked(sc, &cmd);
+	SMMU_UNLOCK(sc);
+
+	return (smmu_sync_poll_consumed(sc, target));
+}
+
+static void
+smmu_domain_sync(device_t dev, struct iommu_domain *iodom)
+{
+	struct smmu_domain *domain;
+	struct smmu_softc *sc;
+
+	sc = device_get_softc(dev);
+	domain = (struct smmu_domain *)iodom;
+	smmu_tlbi_asid(sc, domain->asid);
 }
 
 static void
@@ -714,6 +892,7 @@ smmu_init_ste_bypass(struct smmu_softc *sc, uint32_t sid, uint64_t *ste)
 
 	smmu_invalidate_sid(sc, sid);
 	ste[0] = val;
+	smmu_cache_wb(sc, ste, STRTAB_STE_DWORDS * 8);
 	dsb(sy);
 	smmu_invalidate_sid(sc, sid);
 
@@ -756,6 +935,7 @@ smmu_init_ste_s1(struct smmu_softc *sc, struct smmu_cd *cd,
 
 	/* The STE[0] has to be written in a single blast, last of all. */
 	ste[0] = val;
+	smmu_cache_wb(sc, ste, STRTAB_STE_DWORDS * 8);
 	dsb(sy);
 
 	smmu_invalidate_sid(sc, sid);
@@ -813,6 +993,7 @@ smmu_deinit_ste(struct smmu_softc *sc, int sid)
 
 	ste = smmu_get_ste_addr(sc, sid);
 	ste[0] = 0;
+	smmu_cache_wb(sc, ste, STRTAB_STE_DWORDS * 8);
 
 	smmu_invalidate_sid(sc, sid);
 	smmu_sync_cd(sc, sid, 0, true);
@@ -860,6 +1041,15 @@ smmu_init_cd(struct smmu_softc *sc, struct smmu_domain *domain)
 	val |= CD0_ASET;
 	val |= (uint64_t)domain->asid << CD0_ASID_S;
 	val |= CD0_TG0_4KB;
+	if (sc->features & SMMU_FEATURE_COHERENCY) {
+		val |= CD0_IR0_WBC_RWA;
+		val |= CD0_OR0_WBC_RWA;
+		val |= CD0_SH0_IS;
+	} else {
+		val |= CD0_IR0_NC;
+		val |= CD0_OR0_NC;
+		val |= CD0_SH0_OS;
+	}
 	val |= CD0_EPD1; /* Disable TT1 */
 	val |= ((64 - sc->ias) << CD0_T0SZ_S);
 	val |= CD0_IPS_48BITS;
@@ -876,6 +1066,7 @@ smmu_init_cd(struct smmu_softc *sc, struct smmu_domain *domain)
 
 	/* Install the CD. */
 	ptr[0] = val;
+	smmu_cache_wb(sc, ptr, size);
 
 	return (0);
 }
@@ -908,6 +1099,7 @@ smmu_init_strtab_linear(struct smmu_softc *sc)
 		device_printf(sc->dev, "failed to allocate strtab\n");
 		return (ENXIO);
 	}
+	smmu_cache_wb(sc, strtab->vaddr, size);
 
 	reg = STRTAB_BASE_CFG_FMT_LINEAR;
 	reg |= sc->sid_bits << STRTAB_BASE_CFG_LOG2SIZE_S;
@@ -958,6 +1150,7 @@ smmu_init_strtab_2lvl(struct smmu_softc *sc)
 		device_printf(sc->dev, "Failed to allocate 2lvl strtab.\n");
 		return (ENOMEM);
 	}
+	smmu_cache_wb(sc, strtab->vaddr, l1size);
 
 	sz = strtab->num_l1_entries * sizeof(struct l1_desc);
 
@@ -1034,6 +1227,8 @@ smmu_init_l1_entry(struct smmu_softc *sc, int sid)
 	KASSERT(val == l1_desc->pa, ("bad allocation 4"));
 	val |= l1_desc->span;
 	*addr = val;
+	smmu_cache_wb(sc, l1_desc->va, size);
+	smmu_cache_wb(sc, addr, STRTAB_L1_DESC_DWORDS * 8);
 
 	return (0);
 }
@@ -1052,6 +1247,7 @@ smmu_deinit_l1_entry(struct smmu_softc *sc, int sid)
 	addr = (void *)((uint64_t)strtab->vaddr +
 	    STRTAB_L1_DESC_DWORDS * 8 * i);
 	*addr = 0;
+	smmu_cache_wb(sc, addr, STRTAB_L1_DESC_DWORDS * 8);
 
 	l1_desc = &strtab->l1[sid >> STRTAB_SPLIT];
 	contigfree(l1_desc->va, l1_desc->size, M_SMMU);
@@ -1628,6 +1824,8 @@ smmu_unmap(device_t dev, struct iommu_domain *iodom,
 {
 	struct smmu_domain *domain;
 	struct smmu_softc *sc;
+	vm_offset_t inv_start;
+	bus_size_t inv_size;
 	int err;
 	int i;
 
@@ -1636,13 +1834,14 @@ smmu_unmap(device_t dev, struct iommu_domain *iodom,
 	domain = (struct smmu_domain *)iodom;
 
 	err = 0;
+	inv_start = va;
+	inv_size = 0;
 
 	dprintf("%s: %lx, %ld, domain %d\n", __func__, va, size, domain->asid);
 
 	for (i = 0; i < size; i += PAGE_SIZE) {
 		if (smmu_pmap_remove(&domain->p, va) == 0) {
-			/* pmap entry removed, invalidate TLB. */
-			smmu_tlbi_va(sc, va, domain->asid);
+			inv_size += PAGE_SIZE;
 		} else {
 			err = ENOENT;
 			break;
@@ -1650,8 +1849,37 @@ smmu_unmap(device_t dev, struct iommu_domain *iodom,
 		va += PAGE_SIZE;
 	}
 
-	smmu_sync(sc);
+	if (inv_size != 0) {
+		if (smmu_soc_unmap_asid_tlbi(sc->dev,
+		    inv_size >> PAGE_SHIFT, sc->features)) {
+			smmu_tlbi_asid(sc, domain->asid);
+		} else {
+			smmu_tlbi_va_range_sync(sc, inv_start, inv_size,
+			    domain->asid);
+		}
+	}
 
+	return (err);
+}
+
+static int
+smmu_unmap_nosync(device_t dev __unused, struct iommu_domain *iodom,
+    vm_offset_t va, bus_size_t size)
+{
+	struct smmu_domain *domain;
+	int err;
+	int i;
+
+	domain = (struct smmu_domain *)iodom;
+	err = 0;
+
+	for (i = 0; i < size; i += PAGE_SIZE) {
+		if (smmu_pmap_remove(&domain->p, va) != 0) {
+			err = ENOENT;
+			break;
+		}
+		va += PAGE_SIZE;
+	}
 	return (err);
 }
 
@@ -1662,7 +1890,11 @@ smmu_map(device_t dev, struct iommu_domain *iodom,
 {
 	struct smmu_domain *domain;
 	struct smmu_softc *sc;
+	vm_memattr_t orig_memattr;
+	vm_memattr_t memattr;
 	vm_paddr_t pa;
+	vm_offset_t inv_start;
+	bus_size_t inv_size;
 	int error;
 	int i;
 
@@ -1673,16 +1905,25 @@ smmu_map(device_t dev, struct iommu_domain *iodom,
 	dprintf("%s: %lx -> %lx, %ld, domain %d\n", __func__, va, pa, size,
 	    domain->asid);
 
+	inv_start = va;
+	inv_size = 0;
 	for (i = 0; size > 0; size -= PAGE_SIZE) {
-		pa = VM_PAGE_TO_PHYS(ma[i++]);
-		error = smmu_pmap_enter(&domain->p, va, pa, prot, 0);
+		pa = VM_PAGE_TO_PHYS(ma[i]);
+		orig_memattr = pmap_page_get_memattr(ma[i]);
+		memattr = smmu_dma_memattr(sc, orig_memattr);
+		i++;
+		error = smmu_pmap_enter(&domain->p, va, pa, prot, 0,
+		    memattr);
 		if (error)
 			return (error);
-		smmu_tlbi_va(sc, va, domain->asid);
+		if (!smmu_soc_suppress_map_tlbi(sc->dev))
+			inv_size += PAGE_SIZE;
 		va += PAGE_SIZE;
 	}
 
-	smmu_sync(sc);
+	if (!smmu_soc_suppress_map_tlbi(sc->dev))
+		smmu_tlbi_va_range_sync(sc, inv_start, inv_size,
+		    domain->asid);
 
 	return (0);
 }
@@ -1990,6 +2231,8 @@ static device_method_t smmu_methods[] = {
 	DEVMETHOD(iommu_find,		smmu_find),
 	DEVMETHOD(iommu_map,		smmu_map),
 	DEVMETHOD(iommu_unmap,		smmu_unmap),
+	DEVMETHOD(iommu_unmap_nosync,	smmu_unmap_nosync),
+	DEVMETHOD(iommu_domain_sync,	smmu_domain_sync),
 	DEVMETHOD(iommu_domain_alloc,	smmu_domain_alloc),
 	DEVMETHOD(iommu_domain_free,	smmu_domain_free),
 	DEVMETHOD(iommu_ctx_alloc,	smmu_ctx_alloc),

@@ -83,6 +83,26 @@ METHOD int unmap {
 };
 
 #
+# Unmap a virtual address VA and enqueue required IOTLB invalidation, but
+# do not wait for completion.  The caller must use domain_sync before
+# reusing the IOVA.
+#
+METHOD int unmap_nosync {
+	device_t		dev;
+	struct iommu_domain	*iodom;
+	vm_offset_t		va;
+	bus_size_t		size;
+};
+
+#
+# Complete pending IOTLB invalidations for a domain.
+#
+METHOD void domain_sync {
+	device_t		dev;
+	struct iommu_domain	*iodom;
+};
+
+#
 # Allocate an IOMMU domain.
 #
 METHOD struct iommu_domain * domain_alloc {

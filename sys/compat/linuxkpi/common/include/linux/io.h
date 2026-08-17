@@ -32,6 +32,7 @@
 #include <sys/endian.h>
 #include <sys/types.h>
 
+#include <machine/atomic.h>
 #include <machine/vm.h>
 
 #include <linux/compiler.h>
@@ -130,7 +131,13 @@ __raw_writeq(uint64_t v, volatile void *addr)
 #define	__raw_writeq(v, addr)	__raw_writeq(v, addr)
 #endif
 
+#if defined(__aarch64__)
+#define	mmiowb()	dsb(st)
+#elif defined(wmb)
+#define	mmiowb()	wmb()
+#else
 #define	mmiowb()	barrier()
+#endif
 
 /* Access little-endian MMIO registers atomically with memory barriers. */
 

@@ -37,6 +37,7 @@
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/sx.h>
 #ifdef FDT
 #include <sys/gpio.h>
 #endif
@@ -54,6 +55,8 @@
 #include <dev/usb/usb_bus.h>
 #include <dev/usb/controller/xhci.h>
 #include <dev/usb/controller/dwc3.h>
+#include <dev/usb/controller/dwc3_soc.h>
+#include <dev/usb/typec/usb_typec.h>
 
 #ifdef FDT
 #include <dev/fdt/simplebus.h>
@@ -74,6 +77,7 @@
 #endif
 
 #include "generic_xhci.h"
+#include "usb_role_switch_if.h"
 
 struct snps_dwc3_softc {
 	struct xhci_softc	sc;
@@ -85,12 +89,74 @@ struct snps_dwc3_softc {
 	uint32_t		snpsversion;
 	uint32_t		snpsrevision;
 	uint32_t		snpsversion_type;
+	const struct dwc3_soc_ops *soc_ops;
+	struct sx		role_sx;
+	enum usb_role		role;
+	bool			role_switch;
+	bool			xhci_initialized;
+	bool			retry_scheduled;
 #ifdef FDT
 	clk_t			clk_ref;
 	clk_t			clk_suspend;
 	clk_t			clk_bus;
+	phy_t			usb2_phy;
+	phy_t			usb3_phy;
+	bool			usb2_phy_enabled;
+	bool			usb3_phy_enabled;
 #endif
 };
+
+#ifdef FDT
+static int
+snps_dwc3_disable_phys(struct snps_dwc3_softc *sc)
+{
+	int error, first_error;
+
+	first_error = 0;
+	if (sc->usb3_phy_enabled) {
+		error = phy_disable(sc->usb3_phy);
+		if (error == 0)
+			sc->usb3_phy_enabled = false;
+		else
+			first_error = error;
+	}
+	if (sc->usb2_phy_enabled) {
+		error = phy_disable(sc->usb2_phy);
+		if (error == 0)
+			sc->usb2_phy_enabled = false;
+		else if (first_error == 0)
+			first_error = error;
+	}
+	return (first_error);
+}
+
+static void
+snps_dwc3_release_fdt_resources(struct snps_dwc3_softc *sc)
+{
+
+	(void)snps_dwc3_disable_phys(sc);
+	if (sc->usb3_phy != NULL) {
+		phy_release(sc->usb3_phy);
+		sc->usb3_phy = NULL;
+	}
+	if (sc->usb2_phy != NULL) {
+		phy_release(sc->usb2_phy);
+		sc->usb2_phy = NULL;
+	}
+	if (sc->clk_bus != NULL) {
+		(void)clk_release(sc->clk_bus);
+		sc->clk_bus = NULL;
+	}
+	if (sc->clk_suspend != NULL) {
+		(void)clk_release(sc->clk_suspend);
+		sc->clk_suspend = NULL;
+	}
+	if (sc->clk_ref != NULL) {
+		(void)clk_release(sc->clk_ref);
+		sc->clk_ref = NULL;
+	}
+}
+#endif
 
 #define	DWC3_WRITE(_sc, _off, _val)		\
     bus_space_write_4(_sc->bst, _sc->bsh, _off, _val)
@@ -98,6 +164,8 @@ struct snps_dwc3_softc {
     bus_space_read_4(_sc->bst, _sc->bsh, _off)
 
 #define	IS_DMA_32B	1
+
+static int snps_dwc3_detach_xhci(device_t dev);
 
 static void
 xhci_interrupt_poll(void *_sc)
@@ -126,13 +194,15 @@ snps_dwc3_attach_xhci(device_t dev)
 	    RF_SHAREABLE | RF_ACTIVE);
 	if (sc->sc_irq_res == NULL) {
 		device_printf(dev, "Failed to allocate IRQ\n");
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	sc->sc_bus.bdev = device_add_child(dev, "usbus", -1);
 	if (sc->sc_bus.bdev == NULL) {
 		device_printf(dev, "Failed to add USB device\n");
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	device_set_ivars(sc->sc_bus.bdev, &sc->sc_bus);
@@ -146,17 +216,19 @@ snps_dwc3_attach_xhci(device_t dev)
 		if (err != 0) {
 			device_printf(dev, "Failed to setup IRQ, %d\n", err);
 			sc->sc_intr_hdl = NULL;
-			return (err);
+			goto fail;
 		}
 	}
 
 	err = xhci_init(sc, dev, IS_DMA_32B);
 	if (err != 0) {
 		device_printf(dev, "Failed to init XHCI, with error %d\n", err);
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	usb_callout_init_mtx(&sc->sc_callout, &sc->sc_bus.bus_mtx, 0);
+	snps_sc->xhci_initialized = true;
 
 	if (xhci_use_polling() != 0) {
 		device_printf(dev, "Interrupt polling at %dHz\n", hz);
@@ -168,16 +240,61 @@ snps_dwc3_attach_xhci(device_t dev)
 	err = xhci_start_controller(sc);
 	if (err != 0) {
 		device_printf(dev, "Failed to start XHCI controller, with error %d\n", err);
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
-	device_printf(sc->sc_bus.bdev, "trying to attach\n");
 	err = device_probe_and_attach(sc->sc_bus.bdev);
 	if (err != 0) {
 		device_printf(dev, "Failed to initialize USB, with error %d\n", err);
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
+	return (0);
+
+fail:
+	(void)snps_dwc3_detach_xhci(dev);
+	return (err);
+}
+
+static int
+snps_dwc3_detach_xhci(device_t dev)
+{
+	struct snps_dwc3_softc *snps_sc;
+	struct xhci_softc *sc;
+	int error;
+
+	snps_sc = device_get_softc(dev);
+	sc = &snps_sc->sc;
+
+	error = device_delete_children(dev);
+	if (error != 0)
+		return (error);
+	sc->sc_bus.bdev = NULL;
+	if (snps_sc->xhci_initialized) {
+		usb_callout_drain(&sc->sc_callout);
+		(void)xhci_halt_controller(sc);
+		(void)xhci_reset_controller(sc);
+	}
+	if (sc->sc_irq_res != NULL && sc->sc_intr_hdl != NULL) {
+		error = bus_teardown_intr(dev, sc->sc_irq_res,
+		    sc->sc_intr_hdl);
+		if (error != 0)
+			device_printf(dev, "Could not tear down irq, %d\n",
+			    error);
+		sc->sc_intr_hdl = NULL;
+	}
+	if (sc->sc_irq_res != NULL) {
+		bus_release_resource(dev, SYS_RES_IRQ,
+		    rman_get_rid(sc->sc_irq_res), sc->sc_irq_res);
+		sc->sc_irq_res = NULL;
+	}
+	if (snps_sc->xhci_initialized) {
+		xhci_uninit(sc);
+		snps_sc->xhci_initialized = false;
+	}
+	sc->sc_io_res = NULL;
 	return (0);
 }
 
@@ -283,8 +400,55 @@ snps_dwc3_configure_host(struct snps_dwc3_softc *sc)
 	 * XXX If we ever support more than host mode this needs a dr_mode check.
 	 */
 	reg = DWC3_READ(sc, DWC3_GUCTL);
-	reg |= DWC3_GUCTL_HOST_AUTO_RETRY;
+	if (sc->soc_ops == NULL ||
+	    (sc->soc_ops->flags & DWC3_SOC_F_NO_HOST_AUTO_RETRY) == 0)
+		reg |= DWC3_GUCTL_HOST_AUTO_RETRY;
 	DWC3_WRITE(sc, DWC3_GUCTL, reg);
+}
+
+static int
+snps_dwc3_soc_configure_core(struct snps_dwc3_softc *sc)
+{
+	struct dwc3_soc_context context;
+	uint64_t rate;
+#ifdef FDT
+	int error;
+#endif
+
+	if (sc->soc_ops == NULL || sc->soc_ops->configure_core == NULL)
+		return (0);
+
+#ifdef FDT
+	error = clk_get_freq(sc->clk_ref, &rate);
+	if (error != 0 || rate == 0) {
+		device_printf(sc->dev,
+		    "cannot determine ref_clk frequency: %d\n", error);
+		return (error != 0 ? error : ENXIO);
+	}
+#else
+	rate = 0;
+#endif
+
+	context.dev = sc->dev;
+	context.bst = sc->bst;
+	context.bsh = sc->bsh;
+	context.ref_clk_rate = rate;
+	return (sc->soc_ops->configure_core(&context));
+}
+
+static void
+snps_dwc3_soc_pipe_setup(struct snps_dwc3_softc *sc)
+{
+	struct dwc3_soc_context context;
+
+	if (sc->soc_ops == NULL || sc->soc_ops->pipe_setup == NULL)
+		return;
+
+	context.dev = sc->dev;
+	context.bst = sc->bst;
+	context.bsh = sc->bsh;
+	context.ref_clk_rate = 0;
+	sc->soc_ops->pipe_setup(&context);
 }
 
 #ifdef FDT
@@ -313,6 +477,52 @@ snps_dwc3_configure_phy(struct snps_dwc3_softc *sc, phandle_t node)
 	DWC3_WRITE(sc, DWC3_GUSB2PHYCFG0, reg);
 	OF_prop_free(phy_type);
 }
+
+static int
+snps_dwc3_enable_required_clk(device_t dev, clk_t clk, const char *name)
+{
+	int error;
+
+	if (clk == NULL) {
+		device_printf(dev, "required clock %s missing\n", name);
+		return (ENXIO);
+	}
+
+	error = clk_enable(clk);
+	if (error != 0) {
+		device_printf(dev, "clock %s enable error=%d\n", name, error);
+		return (error);
+	}
+	return (0);
+}
+
+static void
+snps_dwc3_retry_attach(void *arg)
+{
+	device_t dev;
+	int error;
+
+	dev = arg;
+	error = device_probe_and_attach(dev);
+	if (error != 0)
+		device_printf(dev, "config-hook retry attach failed: %d\n",
+		    error);
+}
+
+static void
+snps_dwc3_schedule_retry(struct snps_dwc3_softc *sc, const char *reason,
+    int error)
+{
+
+	if (sc->soc_ops == NULL || sc->retry_scheduled)
+		return;
+
+	sc->retry_scheduled = true;
+	device_printf(sc->dev,
+	    "schedule config-hook retry for %s error=%d\n", reason, error);
+	config_intrhook_oneshot(snps_dwc3_retry_attach, sc->dev);
+}
+
 #endif
 
 static void
@@ -329,7 +539,10 @@ snps_dwc3_do_quirks(struct snps_dwc3_softc *sc)
 		reg |= DWC3_GUSB2PHYCFG0_U2_FREECLK_EXISTS;
 	if (device_has_property(sc->dev, "snps,dis_u2_susphy_quirk"))
 		reg &= ~DWC3_GUSB2PHYCFG0_SUSPENDUSB20;
-	else if ((ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
+	else if ((sc->soc_ops == NULL ||
+	    (sc->soc_ops->flags &
+	    DWC3_SOC_F_KEEP_DUAL_ROLE_PHYS_ACTIVE) == 0) &&
+	    (ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
 	    DWC3_GHWPARAMS0_MODE_DUALROLEDEVICE)
 		reg |= DWC3_GUSB2PHYCFG0_SUSPENDUSB20;
 	if (device_has_property(sc->dev, "snps,dis_enblslpm_quirk"))
@@ -350,7 +563,10 @@ snps_dwc3_do_quirks(struct snps_dwc3_softc *sc)
 		reg |= DWC3_GUSB3PIPECTL0_DISRXDETINP3;
 	if (device_has_property(sc->dev, "snps,dis_u3_susphy_quirk"))
 		reg &= ~DWC3_GUSB3PIPECTL0_SUSPENDUSB3;
-	else if ((ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
+	else if ((sc->soc_ops == NULL ||
+	    (sc->soc_ops->flags &
+	    DWC3_SOC_F_KEEP_DUAL_ROLE_PHYS_ACTIVE) == 0) &&
+	    (ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
 	    DWC3_GHWPARAMS0_MODE_DUALROLEDEVICE)
 		reg |= DWC3_GUSB3PIPECTL0_SUSPENDUSB3;
 	DWC3_WRITE(sc, DWC3_GUSB3PIPECTL0, reg);
@@ -360,6 +576,131 @@ snps_dwc3_do_quirks(struct snps_dwc3_softc *sc)
 		xsc = &sc->sc;
 		xsc->sc_quirks |= XHCI_QUIRK_DISABLE_PORT_PED;
 	}
+}
+
+#ifdef FDT
+static int
+snps_dwc3_enable_phys(struct snps_dwc3_softc *sc)
+{
+	int error;
+
+	if (sc->usb2_phy != NULL && !sc->usb2_phy_enabled) {
+		error = phy_enable(sc->usb2_phy);
+		if (error != 0)
+			return (error);
+		sc->usb2_phy_enabled = true;
+	}
+	if (sc->usb3_phy != NULL && !sc->usb3_phy_enabled) {
+		error = phy_enable(sc->usb3_phy);
+		if (error != 0) {
+			(void)snps_dwc3_disable_phys(sc);
+			return (error);
+		}
+		sc->usb3_phy_enabled = true;
+	}
+	return (0);
+}
+#endif
+
+static int
+snps_dwc3_start_host(struct snps_dwc3_softc *sc)
+{
+	int error;
+
+#ifdef FDT
+	error = snps_dwc3_enable_phys(sc);
+	if (error != 0)
+		return (error);
+#endif
+	snps_dwc3_reset(sc);
+	snps_dwc3_soc_pipe_setup(sc);
+	snps_dwc3_configure_host(sc);
+	error = snps_dwc3_soc_configure_core(sc);
+	if (error != 0)
+		goto fail;
+	snps_dwc3_do_quirks(sc);
+	error = snps_dwc3_attach_xhci(sc->dev);
+	if (error == 0) {
+		sc->role = USB_ROLE_HOST;
+		return (0);
+	}
+
+fail:
+#ifdef FDT
+	(void)snps_dwc3_disable_phys(sc);
+#endif
+	return (error);
+}
+
+static int
+snps_dwc3_bus_has_devices(struct snps_dwc3_softc *sc)
+{
+	struct usb_bus *bus;
+	uint8_t index;
+	bool found;
+
+	bus = &sc->sc.sc_bus;
+	found = false;
+	USB_BUS_LOCK(bus);
+	if (bus->devices != NULL) {
+		for (index = USB_ROOT_HUB_ADDR + 1;
+		    index < bus->devices_max; index++) {
+			if (bus->devices[index] != NULL) {
+				found = true;
+				break;
+			}
+		}
+	}
+	USB_BUS_UNLOCK(bus);
+	return (found);
+}
+
+static int
+snps_dwc3_stop_host(struct snps_dwc3_softc *sc)
+{
+	int error;
+
+	if (sc->role != USB_ROLE_HOST)
+		return (0);
+	if (snps_dwc3_bus_has_devices(sc))
+		return (EBUSY);
+	error = snps_dwc3_detach_xhci(sc->dev);
+	if (error != 0)
+		return (error);
+	sc->role = USB_ROLE_NONE;
+#ifdef FDT
+	error = snps_dwc3_disable_phys(sc);
+	if (error != 0)
+		return (error);
+#endif
+	return (0);
+}
+
+static int
+snps_dwc3_set_role(device_t dev, enum usb_role role)
+{
+	struct snps_dwc3_softc *sc;
+	int error;
+
+	sc = device_get_softc(dev);
+	if (!sc->role_switch)
+		return (EOPNOTSUPP);
+	if (role == USB_ROLE_DEVICE)
+		return (EOPNOTSUPP);
+	if (role != USB_ROLE_NONE && role != USB_ROLE_HOST)
+		return (EINVAL);
+
+	sx_xlock(&sc->role_sx);
+	bus_topo_lock();
+	if (role == sc->role)
+		error = 0;
+	else if (role == USB_ROLE_HOST)
+		error = snps_dwc3_start_host(sc);
+	else
+		error = snps_dwc3_stop_host(sc);
+	bus_topo_unlock();
+	sx_xunlock(&sc->role_sx);
+	return (error);
 }
 
 static int
@@ -374,9 +715,11 @@ snps_dwc3_probe_common(device_t dev)
 		device_printf(dev, "Cannot determine dr_mode\n");
 		return (ENXIO);
 	}
-	if (strcmp(dr_mode, "host") != 0) {
+	if (strcmp(dr_mode, "host") != 0 &&
+	    (strcmp(dr_mode, "otg") != 0 ||
+	    !device_has_property(dev, "usb-role-switch"))) {
 		device_printf(dev,
-		    "Found dr_mode '%s' but only 'host' supported. s=%zd\n",
+		    "Found unsupported dr_mode '%s'. s=%zd\n",
 		    dr_mode, s);
 		return (ENXIO);
 	}
@@ -389,21 +732,34 @@ static int
 snps_dwc3_common_attach(device_t dev, bool is_fdt)
 {
 	struct snps_dwc3_softc *sc;
+	char dr_mode[16];
 #ifdef FDT
 	phandle_t node;
-	phy_t usb2_phy, usb3_phy;
 	uint32_t reg;
+	int clock_error, phy_error;
+	bool strict_resources;
 #endif
 	int error, rid;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	sx_init(&sc->role_sx, "dwc3 role");
+	memset(dr_mode, 0, sizeof(dr_mode));
+	(void)device_get_property(dev, "dr_mode", dr_mode, sizeof(dr_mode),
+	    DEVICE_PROP_BUFFER);
+	sc->role = USB_ROLE_NONE;
+	sc->role_switch = is_fdt && strcmp(dr_mode, "otg") == 0 &&
+	    device_has_property(dev, "usb-role-switch");
+	sc->soc_ops = is_fdt ? dwc3_soc_find(dev) : NULL;
+	if (sc->soc_ops != NULL)
+		sc->sc.sc_bus.quirks |= sc->soc_ops->usb_bus_quirks;
 
 	rid = 0;
 	sc->mem_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
 	    RF_ACTIVE);
 	if (sc->mem_res == NULL) {
 		device_printf(dev, "Failed to map memory\n");
+		sx_destroy(&sc->role_sx);
 		return (ENXIO);
 	}
 	sc->bst = rman_get_bustag(sc->mem_res);
@@ -444,39 +800,89 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 		goto skip_phys;
 
 	node = ofw_bus_get_node(dev);
+	clock_error = 0;
+	phy_error = 0;
+	strict_resources = sc->soc_ops != NULL &&
+	    (sc->soc_ops->flags & DWC3_SOC_F_STRICT_RESOURCES) != 0;
 
 	/* Get the clocks if any */
 	if (ofw_bus_is_compatible(dev, "rockchip,rk3328-dwc3") == 1 ||
-	    ofw_bus_is_compatible(dev, "rockchip,rk3568-dwc3") == 1) {
-		if (clk_get_by_ofw_name(dev, node, "ref_clk", &sc->clk_ref) != 0)
-			device_printf(dev, "Cannot get ref_clk\n");
-		if (clk_get_by_ofw_name(dev, node, "suspend_clk", &sc->clk_suspend) != 0)
-			device_printf(dev, "Cannot get suspend_clk\n");
-		if (clk_get_by_ofw_name(dev, node, "bus_clk", &sc->clk_bus) != 0)
-			device_printf(dev, "Cannot get bus_clk\n");
+	    ofw_bus_is_compatible(dev, "rockchip,rk3568-dwc3") == 1 ||
+	    sc->soc_ops != NULL) {
+		error = clk_get_by_ofw_name(dev, node, "ref_clk",
+		    &sc->clk_ref);
+		if (error != 0) {
+			device_printf(dev, "Cannot get ref_clk: %d\n", error);
+			if (strict_resources)
+				clock_error = error;
+		}
+		error = clk_get_by_ofw_name(dev, node, "suspend_clk",
+		    &sc->clk_suspend);
+		if (error != 0) {
+			device_printf(dev, "Cannot get suspend_clk: %d\n", error);
+			if (strict_resources && clock_error == 0)
+				clock_error = error;
+		}
+		error = clk_get_by_ofw_name(dev, node, "bus_clk",
+		    &sc->clk_bus);
+		if (error != 0) {
+			device_printf(dev, "Cannot get bus_clk: %d\n", error);
+			if (strict_resources && clock_error == 0)
+				clock_error = error;
+		}
 	}
 
-	if (sc->clk_ref != NULL) {
-		if (clk_enable(sc->clk_ref) != 0)
+	if (strict_resources) {
+		if (clock_error == 0)
+			clock_error = snps_dwc3_enable_required_clk(dev,
+			    sc->clk_ref, "ref_clk");
+		if (clock_error == 0)
+			clock_error = snps_dwc3_enable_required_clk(dev,
+			    sc->clk_suspend, "suspend_clk");
+		if (clock_error == 0)
+			clock_error = snps_dwc3_enable_required_clk(dev,
+			    sc->clk_bus, "bus_clk");
+		if (clock_error != 0) {
+			snps_dwc3_schedule_retry(sc,
+			    "late clock provider", clock_error);
+			error = ENXIO;
+			goto fail;
+		}
+	} else {
+		if (sc->clk_ref != NULL && clk_enable(sc->clk_ref) != 0)
 			device_printf(dev, "Cannot enable ref_clk\n");
-	}
-	if (sc->clk_suspend != NULL) {
-		if (clk_enable(sc->clk_suspend) != 0)
+		if (sc->clk_suspend != NULL &&
+		    clk_enable(sc->clk_suspend) != 0)
 			device_printf(dev, "Cannot enable suspend_clk\n");
-	}
-	if (sc->clk_bus != NULL) {
-		if (clk_enable(sc->clk_bus) != 0)
+		if (sc->clk_bus != NULL && clk_enable(sc->clk_bus) != 0)
 			device_printf(dev, "Cannot enable bus_clk\n");
 	}
+	snps_dwc3_soc_pipe_setup(sc);
 
 	/* Get the phys */
-	usb2_phy = usb3_phy = NULL;
-	error = phy_get_by_ofw_name(dev, node, "usb2-phy", &usb2_phy);
-	if (error == 0 && usb2_phy != NULL)
-		phy_enable(usb2_phy);
-	error = phy_get_by_ofw_name(dev, node, "usb3-phy", &usb3_phy);
-	if (error == 0 && usb3_phy != NULL)
-		phy_enable(usb3_phy);
+	error = phy_get_by_ofw_name(dev, node, "usb2-phy", &sc->usb2_phy);
+	if ((error != 0 || sc->usb2_phy == NULL) && strict_resources) {
+		device_printf(dev, "usb2-phy get error=%d phy=%p\n",
+		    error, sc->usb2_phy);
+		if (phy_error == 0)
+			phy_error = error != 0 ? error : ENXIO;
+	}
+	error = phy_get_by_ofw_name(dev, node, "usb3-phy", &sc->usb3_phy);
+	if ((error != 0 || sc->usb3_phy == NULL) && strict_resources) {
+		device_printf(dev, "usb3-phy get error=%d phy=%p\n",
+		    error, sc->usb3_phy);
+		if (phy_error == 0)
+			phy_error = error != 0 ? error : ENXIO;
+	}
+	if (strict_resources && phy_error != 0) {
+		device_printf(dev,
+		    "defer xHCI attach until PHY providers are ready error=%d\n",
+		    phy_error);
+		snps_dwc3_schedule_retry(sc, "late PHY provider",
+		    phy_error);
+		error = ENXIO;
+		goto fail;
+	}
 	if (sc->snpsversion == DWC3_IP_ID) {
 		if (sc->snpsrevision >= 0x290A) {
 			uint32_t hwparams3;
@@ -494,30 +900,55 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 	snps_dwc3_configure_phy(sc, node);
 skip_phys:
 #endif
-
-	snps_dwc3_reset(sc);
-	snps_dwc3_configure_host(sc);
-	snps_dwc3_do_quirks(sc);
-
-#ifdef DWC3_DEBUG
-	snsp_dwc3_dump_regs(sc, "Pre XHCI init");
-#endif
-	error = snps_dwc3_attach_xhci(dev);
-#ifdef DWC3_DEBUG
-	snsp_dwc3_dump_regs(sc, "Post XHCI init");
-#endif
-
+	if (sc->role_switch) {
 #ifdef FDT
-	if (error) {
-		if (sc->clk_ref != NULL)
-			clk_disable(sc->clk_ref);
-		if (sc->clk_suspend != NULL)
-			clk_disable(sc->clk_suspend);
-		if (sc->clk_bus != NULL)
-			clk_disable(sc->clk_bus);
-	}
+		OF_device_register_xref(OF_xref_from_node(node), dev);
 #endif
+		error = 0;
+	} else {
+		error = snps_dwc3_start_host(sc);
+		if (error != 0) {
+#ifdef FDT
+			snps_dwc3_schedule_retry(sc,
+			    "host initialization", error);
+#endif
+		}
+	}
+
+fail:
+#ifdef FDT
+	if (error)
+		snps_dwc3_release_fdt_resources(sc);
+#endif
+	if (error != 0 && sc->mem_res != NULL) {
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mem_res);
+		sc->mem_res = NULL;
+	}
+	if (error != 0)
+		sx_destroy(&sc->role_sx);
 	return (error);
+}
+
+static int
+snps_dwc3_common_detach(device_t dev, bool is_fdt)
+{
+	struct snps_dwc3_softc *sc;
+	int error;
+
+	sc = device_get_softc(dev);
+	error = snps_dwc3_stop_host(sc);
+	if (error != 0)
+		return (error);
+#ifdef FDT
+	if (is_fdt)
+		snps_dwc3_release_fdt_resources(sc);
+#endif
+	if (sc->mem_res != NULL) {
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mem_res);
+		sc->mem_res = NULL;
+	}
+	sx_destroy(&sc->role_sx);
+	return (0);
 }
 
 #ifdef FDT
@@ -546,10 +977,19 @@ snps_dwc3_fdt_attach(device_t dev)
 	return (snps_dwc3_common_attach(dev, true));
 }
 
+static int
+snps_dwc3_fdt_detach(device_t dev)
+{
+
+	return (snps_dwc3_common_detach(dev, true));
+}
+
 static device_method_t snps_dwc3_fdt_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		snps_dwc3_fdt_probe),
 	DEVMETHOD(device_attach,	snps_dwc3_fdt_attach),
+	DEVMETHOD(device_detach,	snps_dwc3_fdt_detach),
+	DEVMETHOD(usb_role_switch_set,	snps_dwc3_set_role),
 
 	DEVMETHOD_END
 };
@@ -604,10 +1044,18 @@ snps_dwc3_acpi_attach(device_t dev)
 	return (snps_dwc3_common_attach(dev, false));
 }
 
+static int
+snps_dwc3_acpi_detach(device_t dev)
+{
+
+	return (snps_dwc3_common_detach(dev, false));
+}
+
 static device_method_t snps_dwc3_acpi_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		snps_dwc3_acpi_probe),
 	DEVMETHOD(device_attach,	snps_dwc3_acpi_attach),
+	DEVMETHOD(device_detach,	snps_dwc3_acpi_detach),
 
 	DEVMETHOD_END
 };

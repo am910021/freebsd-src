@@ -128,6 +128,16 @@ static void usb_dev_resume_peer(struct usb_device *udev);
 static void usb_dev_suspend_peer(struct usb_device *udev);
 static uint8_t usb_peer_should_wakeup(struct usb_device *udev);
 
+static bool
+uhub_root_bus_has_quirk(struct uhub_softc *sc, uint8_t quirk)
+{
+
+	if (sc == NULL || sc->sc_udev == NULL ||
+	    sc->sc_udev->parent_hub != NULL || sc->sc_udev->bus == NULL)
+		return (false);
+	return ((sc->sc_udev->bus->quirks & quirk) != 0);
+}
+
 static const struct usb_config uhub_config[UHUB_N_TRANSFER] = {
 	[UHUB_INTR_TRANSFER] = {
 		.type = UE_INTERRUPT,
@@ -716,7 +726,10 @@ repeat:
 		}
 		/* check if something changed during port reset */
 
-		if ((sc->sc_st.port_change & UPS_C_CONNECT_STATUS) ||
+		if (((sc->sc_st.port_change & UPS_C_CONNECT_STATUS) &&
+		    !(udev->speed == USB_SPEED_SUPER &&
+		    uhub_root_bus_has_quirk(sc,
+		    USB_BUS_QUIRK_IGNORE_SS_CONNECT_CHANGE))) ||
 		    (!(sc->sc_st.port_status & UPS_CURRENT_CONNECT_STATUS))) {
 			if (timeout) {
 				DPRINTFN(1, "giving up port %d reset - "
@@ -779,7 +792,9 @@ repeat:
 		speed = udev->speed;
 		break;
 	}
-	if (speed == USB_SPEED_SUPER) {
+	if (speed == USB_SPEED_SUPER &&
+	    !uhub_root_bus_has_quirk(sc,
+	    USB_BUS_QUIRK_DISABLE_SS_U1_TIMEOUT)) {
 		err = usbd_req_set_hub_u1_timeout(udev, NULL,
 		    portno, 128 - (2 * udev->depth));
 		if (err) {

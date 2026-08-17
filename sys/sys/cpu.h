@@ -122,12 +122,17 @@ TAILQ_HEAD(cf_level_lst, cf_level);
  * The "uncached" flag tells CPUFREQ_DRV_GET to try obtaining the real
  * instantaneous frequency from the underlying hardware regardless of cached
  * state. It is probably a bug to not combine this with "info only"
+ *
+ * The "per domain" flag tells the cpufreq core that the driver controls its
+ * own frequency domain.  A sysctl write must not be mirrored to unrelated
+ * cpufreq devices.
  */
 #define CPUFREQ_TYPE_MASK	0xffff
 #define CPUFREQ_TYPE_RELATIVE	(1<<0)
 #define CPUFREQ_TYPE_ABSOLUTE	(1<<1)
 #define CPUFREQ_FLAG_INFO_ONLY	(1<<16)
 #define CPUFREQ_FLAG_UNCACHED	(1<<17)
+#define CPUFREQ_FLAG_PER_DOMAIN	(1<<18)
 
 /*
  * When setting a level, the caller indicates the priority of this request.
@@ -162,7 +167,7 @@ int	cpufreq_settings_changed(device_t dev);
  * The new level and the result of the change (0 is success) is passed in.
  * If the driver wishes to revoke the change from cpufreq_pre_change, it
  * stores a non-zero error code in the result parameter and the change will
- * not be made.  If the post-change eventhandler gets a non-zero result, 
+ * not be made.  If the post-change eventhandler gets a non-zero result,
  * no change was made and the previous level remains in effect.  If a change
  * is revoked, the post-change eventhandler is still called with the error
  * value supplied by the revoking driver.  This gives listeners who cached

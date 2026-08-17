@@ -40,6 +40,9 @@ struct usb_bus_msg {
 	struct usb_bus *bus;
 };
 
+#define	USB_BUS_QUIRK_IGNORE_SS_CONNECT_CHANGE	0x01
+#define	USB_BUS_QUIRK_DISABLE_SS_U1_TIMEOUT	0x02
+
 /*
  * The following structure defines an USB BUS. There is one USB BUS
  * for every Host or Device controller.
@@ -52,7 +55,7 @@ struct usb_bus {
 /* convenience macros */
 #define	USB_BUS_TT_PROC(bus) USB_BUS_NON_GIANT_ISOC_PROC(bus)
 #define	USB_BUS_CS_PROC(bus) USB_BUS_NON_GIANT_ISOC_PROC(bus)
-  
+
 #if USB_HAVE_PER_BUS_PROCESS
 #define	USB_BUS_GIANT_PROC(bus) (&(bus)->giant_callback_proc)
 #define	USB_BUS_NON_GIANT_ISOC_PROC(bus) (&(bus)->non_giant_isoc_callback_proc)
@@ -102,6 +105,7 @@ struct usb_bus {
 #if USB_HAVE_BUSDMA
 	struct usb_dma_parent_tag dma_parent_tag[1];
 	struct usb_dma_tag dma_tags[USB_BUS_DMA_TAG_MAX];
+	uint8_t dma_xfer_alloc_mode;	/* USB_DMA_ALLOC_* for transfer roots */
 #endif
 	const struct usb_bus_methods *methods;	/* filled by HC driver */
 	struct usb_device **devices;
@@ -122,6 +126,7 @@ struct usb_bus {
 	uint8_t no_explore;		/* don't explore USB ports */
 	uint8_t dma_bits;		/* number of DMA address lines */
 	uint8_t control_ep_quirk;	/* need 64kByte buffer for data stage */
+	uint8_t quirks;			/* controller-specific root hub quirks */
 };
 
 #endif					/* _USB_BUS_H_ */

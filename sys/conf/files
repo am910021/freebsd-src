@@ -1563,6 +1563,7 @@ dev/drm2/drm_gem_names.c	optional drm2
 dev/drm2/drm_global.c		optional drm2
 dev/drm2/drm_hashtab.c		optional drm2
 dev/drm2/drm_ioctl.c		optional drm2
+dev/drm2/drm_ioc32.c		optional drm2 compat_freebsd32
 dev/drm2/drm_irq.c		optional drm2
 dev/drm2/drm_linux_list_sort.c	optional drm2
 dev/drm2/drm_lock.c		optional drm2
@@ -3251,6 +3252,9 @@ dev/usb/usb_hid.c		optional usb
 dev/usb/usb_hub.c		optional usb
 dev/usb/usb_hub_acpi.c		optional uacpi acpi
 dev/usb/usb_if.m		optional usb
+dev/usb/typec/fusb302.c		optional fdt iicbus usb fusb302
+dev/usb/typec/typec_switch_if.m	optional fdt usb
+dev/usb/typec/usb_role_switch_if.m optional fdt usb
 dev/usb/usb_lookup.c		optional usb
 dev/usb/usb_mbuf.c		optional usb
 dev/usb/usb_msctest.c		optional usb

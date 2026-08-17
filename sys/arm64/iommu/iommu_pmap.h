@@ -42,7 +42,7 @@ struct smmu_pmap {
 
 /* System MMU (SMMU). */
 int smmu_pmap_enter(struct smmu_pmap *pmap, vm_offset_t va, vm_paddr_t pa,
-    vm_prot_t prot, u_int flags);
+    vm_prot_t prot, u_int flags, vm_memattr_t memattr);
 int smmu_pmap_remove(struct smmu_pmap *pmap, vm_offset_t va);
 
 /* Mali GPU */

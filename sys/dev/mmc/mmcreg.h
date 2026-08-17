@@ -339,6 +339,7 @@ struct mmc_request {
 
 /* Class 10: Switch function commands */
 #define	SD_SWITCH_FUNC		6
+#define	SD_SWITCH_VOLTAGE	11
 			/* reserved: 34 */
 			/* reserved: 35 */
 			/* reserved: 36 */

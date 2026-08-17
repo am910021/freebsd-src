@@ -34,6 +34,7 @@
 #define	_ARM64_IOMMU_SMMUVAR_H_
 
 #include <arm64/iommu/iommu_pmap.h>
+#include <arm64/iommu/smmu_platform.h>
 
 #define	SMMU_DEVSTR		"ARM System Memory Management Unit"
 #define	SMMU_LOCK(_sc)		mtx_lock(&(_sc)->sc_mtx)
@@ -103,6 +104,10 @@ struct smmu_cmdq_entry {
 			uint16_t asid;
 			uint16_t vmid;
 			vm_offset_t addr;
+			uint8_t num;
+			uint8_t scale;
+			uint8_t ttl;
+			uint8_t tg;
 			bool leaf;
 		} tlbi;
 		struct {
@@ -138,6 +143,7 @@ struct smmu_softc {
 	device_t		dev;
 	struct resource		*res[5];
 	void			*intr_cookie[3];
+	int			dma_memattr_policy;
 	uint32_t		ias; /* Intermediate Physical Address */
 	uint32_t		oas; /* Physical Address */
 	uint32_t		asid_bits;

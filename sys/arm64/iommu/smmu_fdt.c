@@ -86,6 +86,7 @@ smmu_fdt_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	sc->dma_memattr_policy = smmu_fdt_platform_dma_memattr_policy(dev);
 
 	node = ofw_bus_get_node(dev);
 

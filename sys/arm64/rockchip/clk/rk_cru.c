@@ -108,6 +108,37 @@ rk_cru_modify_4(device_t dev, bus_addr_t addr, uint32_t clr, uint32_t set)
 }
 
 static int
+rk_cru_reset_lookup(struct rk_cru_softc *sc, intptr_t id, uint32_t *reg,
+    int *bit)
+{
+	int i;
+
+	if (sc->reset_map != NULL) {
+		for (i = 0; i < sc->nreset_map; i++) {
+			if (sc->reset_map[i].id != id)
+				continue;
+			*reg = sc->reset_map[i].offset;
+			*bit = sc->reset_map[i].bit;
+			return (0);
+		}
+		if (sc->reset_map_strict) {
+			device_printf(sc->dev,
+			    "reset id %jd missing from strict map; "
+			    "refusing linear fallback\n",
+			    (intmax_t)id);
+			return (ENXIO);
+		}
+	}
+
+	if (id > sc->reset_num)
+		return (ENXIO);
+
+	*reg = sc->reset_offset + id / 16 * 4;
+	*bit = id % 16;
+	return (0);
+}
+
+static int
 rk_cru_reset_assert(device_t dev, intptr_t id, bool reset)
 {
 	struct rk_cru_softc *sc;
@@ -117,11 +148,8 @@ rk_cru_reset_assert(device_t dev, intptr_t id, bool reset)
 
 	sc = device_get_softc(dev);
 
-	if (id > sc->reset_num)
+	if (rk_cru_reset_lookup(sc, id, &reg, &bit) != 0)
 		return (ENXIO);
-
-	reg = sc->reset_offset + id / 16 * 4;
-	bit = id % 16;
 
 	mtx_lock(&sc->mtx);
 	val = 0;
@@ -143,10 +171,8 @@ rk_cru_reset_is_asserted(device_t dev, intptr_t id, bool *reset)
 
 	sc = device_get_softc(dev);
 
-	if (id > sc->reset_num)
+	if (rk_cru_reset_lookup(sc, id, &reg, &bit) != 0)
 		return (ENXIO);
-	reg = sc->reset_offset + id / 16 * 4;
-	bit = id % 16;
 
 	mtx_lock(&sc->mtx);
 	val = CCU_READ4(sc, reg);
@@ -196,6 +222,7 @@ rk_cru_register_gates(struct rk_cru_softc *sc)
 		def.mask = 1;
 		def.on_value = 0;
 		def.off_value = 1;
+		def.gate_flags = sc->gate_flags | sc->gates[i].gate_flags;
 		rk_clk_gate_register(sc->clkdom, &def);
 	}
 
@@ -239,6 +266,10 @@ rk_cru_attach(device_t dev)
 			break;
 		case RK3399_CLK_PLL:
 			rk3399_clk_pll_register(sc->clkdom,
+			    sc->clks[i].clk.pll);
+			break;
+		case RK3588_CLK_PLL:
+			rk3588_clk_pll_register(sc->clkdom,
 			    sc->clks[i].clk.pll);
 			break;
 		case RK_CLK_COMPOSITE:

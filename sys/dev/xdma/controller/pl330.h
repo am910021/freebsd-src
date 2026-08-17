@@ -57,16 +57,26 @@
 #define	 CCR_SRC_BURST_SIZE_4	(2 << CCR_SRC_BURST_SIZE_S)
 #define	 CCR_DST_INC		(1 << 14)
 #define	 CCR_SRC_INC		(1 << 0)
+#define	 CCR_SRC_BURST_LEN_S	4
+#define	 CCR_DST_BURST_LEN_S	18
+#define	 CCR_SRC_NS		(1 << 9)
+#define	 CCR_DST_NS		(1 << 23)
 #define	 CCR_DST_PROT_CTRL_S	22
 #define	 CCR_DST_PROT_PRIV	(1 << CCR_DST_PROT_CTRL_S)
 #define	LC0(n)		(0x40C + 0x20 * (n)) /* Loop counter 0 for DMA channel n */
 #define	LC1(n)		(0x410 + 0x20 * (n)) /* Loop counter 1 for DMA channel n */
 
 #define	DBGSTATUS	0xD00 /* Debug Status */
+#define	 DBGSTATUS_BUSY		(1 << 0)
 #define	DBGCMD		0xD04 /* Debug Command */
 #define	DBGINST0	0xD08 /* Debug Instruction-0 */
 #define	DBGINST1	0xD0C /* Debug Instruction-1 */
 #define	CR0		0xE00 /* Configuration Register 0 */
+#define	 CR0_BOOT_MAN_NS	(1 << 2)
+#define	 CR0_NUM_CHANS_SHIFT	4
+#define	 CR0_NUM_CHANS_MASK	0x7
+#define	 CR0_NUM_EVENTS_SHIFT	17
+#define	 CR0_NUM_EVENTS_MASK	0x1f
 #define	CR1		0xE04 /* Configuration Register 1 */
 #define	CR2		0xE08 /* Configuration Register 2 */
 #define	CR3		0xE0C /* Configuration Register 3 */

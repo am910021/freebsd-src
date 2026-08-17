@@ -64,6 +64,7 @@
 #include <dev/extres/clk/clk.h>
 
 #include <dev/mmc/host/dwmmc_reg.h>
+#include <dev/mmc/host/dwmmc_soc.h>
 #include <dev/mmc/host/dwmmc_var.h>
 
 #include "opt_mmccam.h"
@@ -105,9 +106,11 @@
 #define	PENDING_CMD	0x01
 #define	PENDING_STOP	0x02
 #define	CARD_INIT_DONE	0x04
+#define	RETRY_CMD	0x08
 
 #define	DWMMC_DATA_ERR_FLAGS	(SDMMC_INTMASK_DRT | SDMMC_INTMASK_DCRC \
-				|SDMMC_INTMASK_SBE | SDMMC_INTMASK_EBE)
+				|SDMMC_INTMASK_HTO | SDMMC_INTMASK_SBE \
+				|SDMMC_INTMASK_EBE)
 #define	DWMMC_CMD_ERR_FLAGS	(SDMMC_INTMASK_RTO | SDMMC_INTMASK_RCRC \
 				|SDMMC_INTMASK_RE)
 #define	DWMMC_ERR_FLAGS		(DWMMC_DATA_ERR_FLAGS | DWMMC_CMD_ERR_FLAGS \
@@ -151,11 +154,80 @@ struct idmac_desc {
 
 static void dwmmc_next_operation(struct dwmmc_softc *);
 static int dwmmc_setup_bus(struct dwmmc_softc *, int);
+static int dwmmc_ctrl_reset(struct dwmmc_softc *, int);
+static int dwmmc_update_ios(device_t, device_t);
+static int dwmmc_switch_vccq(device_t, device_t);
+static int dwmmc_set_safe_power_off(device_t, const char *);
 static int dma_done(struct dwmmc_softc *, struct mmc_command *);
-static int dma_stop(struct dwmmc_softc *);
+static int dma_stop(struct dwmmc_softc *, bool);
 static void pio_read(struct dwmmc_softc *, struct mmc_command *);
 static void pio_write(struct dwmmc_softc *, struct mmc_command *);
 static void dwmmc_handle_card_present(struct dwmmc_softc *sc, bool is_present);
+static void dwmmc_tasklet(struct dwmmc_softc *);
+
+static void
+dwmmc_cmd_timeout(void *arg)
+{
+	struct dwmmc_softc *sc;
+	struct mmc_command *cmd;
+
+	sc = arg;
+	cmd = sc->curcmd;
+	if (cmd == NULL || sc->cmd_done)
+		return;
+	if (cmd->opcode == MMC_SEND_TUNING_BLOCK) {
+		cmd->error = MMC_ERR_TIMEOUT;
+		if (!sc->use_pio && cmd->data != NULL) {
+			dma_done(sc, cmd);
+			if (dma_stop(sc, true) != 0)
+				device_printf(sc->dev,
+				    "CMD19 timeout IDMAC recovery failed\n");
+			WRITE4(sc, SDMMC_DBADDR, sc->desc_ring_paddr);
+			WRITE4(sc, SDMMC_IDSTS, SDMMC_IDINTEN_MASK);
+			WRITE4(sc, SDMMC_IDINTEN, SDMMC_IDINTEN_NI |
+			    SDMMC_IDINTEN_RI | SDMMC_IDINTEN_TI);
+		} else if (dwmmc_ctrl_reset(sc, SDMMC_CTRL_RESET |
+		    SDMMC_CTRL_FIFO_RESET | SDMMC_CTRL_DMA_RESET) != 0) {
+			device_printf(sc->dev,
+			    "CMD19 timeout controller recovery failed\n");
+		}
+		WRITE4(sc, SDMMC_RINTSTS, 0xffffffff);
+		if (dwmmc_setup_bus(sc, sc->host.ios.clock) != 0)
+			device_printf(sc->dev,
+			    "CMD19 timeout clock recovery failed\n");
+		sc->cmd_done = 1;
+		dwmmc_tasklet(sc);
+		return;
+	}
+	if (cmd->opcode == MMC_STOP_TRANSMISSION) {
+		device_printf(sc->dev,
+		    "CMD12 recovery timed out; abandoning retry\n");
+		cmd->error = MMC_ERR_TIMEOUT;
+		sc->cmd_done = 1;
+		dwmmc_tasklet(sc);
+		return;
+	}
+	if (cmd->opcode != SD_SWITCH_VOLTAGE)
+		return;
+	device_printf(sc->dev, "CMD11 completion timed out\n");
+	cmd->error = MMC_ERR_TIMEOUT;
+	sc->cmd_done = 1;
+	dwmmc_tasklet(sc);
+}
+
+static void
+dwmmc_release_supplies(struct dwmmc_softc *sc)
+{
+
+	if (sc->mmc_helper.vqmmc_supply != NULL)
+		regulator_release(sc->mmc_helper.vqmmc_supply);
+	if (sc->mmc_helper.vmmc_supply != NULL)
+		regulator_release(sc->mmc_helper.vmmc_supply);
+	sc->mmc_helper.vqmmc_supply = NULL;
+	sc->mmc_helper.vmmc_supply = NULL;
+	sc->vqmmc = NULL;
+	sc->vmmc = NULL;
+}
 
 static struct resource_spec dwmmc_spec[] = {
 	{ SYS_RES_MEMORY,	0,	RF_ACTIVE },
@@ -377,6 +449,8 @@ dwmmc_intr(void *arg)
 {
 	struct mmc_command *cmd;
 	struct dwmmc_softc *sc;
+	bool defer_recovery;
+	uint32_t data_err;
 	uint32_t reg;
 
 	sc = arg;
@@ -384,33 +458,80 @@ dwmmc_intr(void *arg)
 	DWMMC_LOCK(sc);
 
 	cmd = sc->curcmd;
+	defer_recovery = false;
 
 	/* First handle SDMMC controller interrupts */
 	reg = READ4(sc, SDMMC_MINTSTS);
 	if (reg) {
+		data_err = reg & DWMMC_DATA_ERR_FLAGS;
+		if (cmd != NULL && cmd->opcode == SD_SWITCH_VOLTAGE)
+			data_err &= ~SDMMC_INTMASK_HTO;
 		dprintf("%s 0x%08x\n", __func__, reg);
+		if (cmd == NULL &&
+		    (reg & (DWMMC_CMD_ERR_FLAGS | DWMMC_DATA_ERR_FLAGS)) != 0)
+			device_printf(sc->dev,
+			    "ignoring stale error interrupt %#x\n", reg);
 
-		if (reg & DWMMC_CMD_ERR_FLAGS) {
+		if (cmd != NULL && (reg & DWMMC_CMD_ERR_FLAGS) != 0) {
 			dprintf("cmd err 0x%08x cmd 0x%08x\n",
 				reg, cmd->opcode);
 			cmd->error = MMC_ERR_TIMEOUT;
 		}
 
-		if (reg & DWMMC_DATA_ERR_FLAGS) {
+		if (cmd != NULL && data_err != 0) {
 			dprintf("data err 0x%08x cmd 0x%08x\n",
 				reg, cmd->opcode);
-			cmd->error = MMC_ERR_FAILED;
-			if (!sc->use_pio) {
-				dma_done(sc, cmd);
-				dma_stop(sc);
+			cmd->error = (data_err & SDMMC_INTMASK_HTO) != 0 ?
+			    MMC_ERR_TIMEOUT : MMC_ERR_FAILED;
+			if ((data_err & SDMMC_INTMASK_HTO) != 0) {
+				sc->cmd_done = 1;
+#ifndef MMCCAM
+				if (sc->req != NULL && sc->req->stop != NULL &&
+				    (cmd->opcode == MMC_READ_MULTIPLE_BLOCK ||
+				    cmd->opcode == MMC_WRITE_MULTIPLE_BLOCK)) {
+					defer_recovery = true;
+					sc->flags |= PENDING_STOP;
+					if (cmd->opcode == MMC_READ_MULTIPLE_BLOCK &&
+					    cmd->retries == 0)
+						sc->flags |= RETRY_CMD;
+				}
+#endif
 			}
+			if (!sc->use_pio && cmd->data != NULL) {
+				dma_done(sc, cmd);
+				if (dma_stop(sc, !defer_recovery) != 0)
+					device_printf(sc->dev,
+					    "data-error IDMAC recovery failed\n");
+				WRITE4(sc, SDMMC_DBADDR, sc->desc_ring_paddr);
+				WRITE4(sc, SDMMC_IDSTS, SDMMC_IDINTEN_MASK);
+				WRITE4(sc, SDMMC_IDINTEN,
+				    SDMMC_IDINTEN_NI | SDMMC_IDINTEN_RI |
+				    SDMMC_IDINTEN_TI);
+			} else if (dwmmc_ctrl_reset(sc, SDMMC_CTRL_RESET |
+			    SDMMC_CTRL_FIFO_RESET | SDMMC_CTRL_DMA_RESET) != 0) {
+				device_printf(sc->dev,
+				    "data-error controller recovery failed\n");
+			}
+			if (!defer_recovery &&
+			    dwmmc_setup_bus(sc, sc->host.ios.clock) != 0)
+				device_printf(sc->dev,
+				    "data-error clock recovery failed\n");
 		}
 
-		if (reg & SDMMC_INTMASK_CMD_DONE) {
+		if (cmd != NULL && (reg & SDMMC_INTMASK_CMD_DONE) != 0) {
 			dwmmc_cmd_done(sc);
 			sc->cmd_done = 1;
 		}
-
+		if (cmd != NULL && cmd->opcode == SD_SWITCH_VOLTAGE &&
+		    (reg & SDMMC_INTMASK_VOLT_SWITCH) != 0) {
+			dwmmc_cmd_done(sc);
+			sc->cmd_done = 1;
+		}
+		if (cmd != NULL && sc->cmd_done &&
+		    (cmd->opcode == SD_SWITCH_VOLTAGE ||
+		    cmd->opcode == MMC_SEND_TUNING_BLOCK ||
+		    cmd->opcode == MMC_STOP_TRANSMISSION))
+			callout_stop(&sc->cmd11_callout);
 		if (reg & SDMMC_INTMASK_ACD)
 			sc->acd_rcvd = 1;
 
@@ -427,10 +548,12 @@ dwmmc_intr(void *arg)
 	WRITE4(sc, SDMMC_RINTSTS, reg);
 
 	if (sc->use_pio) {
-		if (reg & (SDMMC_INTMASK_RXDR|SDMMC_INTMASK_DTO)) {
+		if (cmd != NULL &&
+		    (reg & (SDMMC_INTMASK_RXDR|SDMMC_INTMASK_DTO)) != 0) {
 			pio_read(sc, cmd);
 		}
-		if (reg & (SDMMC_INTMASK_TXDR|SDMMC_INTMASK_DTO)) {
+		if (cmd != NULL &&
+		    (reg & (SDMMC_INTMASK_TXDR|SDMMC_INTMASK_DTO)) != 0) {
 			pio_write(sc, cmd);
 		}
 	} else {
@@ -442,7 +565,8 @@ dwmmc_intr(void *arg)
 				WRITE4(sc, SDMMC_IDSTS, (SDMMC_IDINTEN_TI |
 							 SDMMC_IDINTEN_RI));
 				WRITE4(sc, SDMMC_IDSTS, SDMMC_IDINTEN_NI);
-				dma_done(sc, cmd);
+				if (cmd != NULL)
+					dma_done(sc, cmd);
 			}
 		}
 	}
@@ -522,13 +646,23 @@ parse_fdt(struct dwmmc_softc *sc)
 	sc->host.f_max = 200000000;
 	sc->host.host_ocr = MMC_OCR_320_330 | MMC_OCR_330_340;
 	sc->host.caps = MMC_CAP_HSPEED | MMC_CAP_SIGNALING_330;
-	mmc_fdt_parse(sc->dev, node, &sc->mmc_helper, &sc->host);
+	error = mmc_fdt_parse(sc->dev, node, &sc->mmc_helper, &sc->host);
+	if (error != 0)
+		goto fail;
+	sc->vmmc = sc->mmc_helper.vmmc_supply;
+	sc->vqmmc = sc->mmc_helper.vqmmc_supply;
+	dwmmc_soc_apply_fdt_defaults(sc);
+	OF_getencprop(node, "power-off-delay-ms", &sc->power_off_delay_ms,
+	    sizeof(sc->power_off_delay_ms));
+	dwmmc_soc_diag(sc, "parse begin f_min=%u f_max=%u caps=0x%x\n",
+	    sc->host.f_min, sc->host.f_max, sc->host.caps);
 
 	/* fifo-depth */
 	if ((len = OF_getproplen(node, "fifo-depth")) > 0) {
 		OF_getencprop(node, "fifo-depth", dts_value, len);
 		sc->fifo_depth = dts_value[0];
 	}
+	dwmmc_soc_diag(sc, "fifo-depth=%u\n", sc->fifo_depth);
 
 	/* num-slots (Deprecated) */
 	sc->num_slots = 1;
@@ -543,6 +677,8 @@ parse_fdt(struct dwmmc_softc *sc)
 		OF_getencprop(node, "clock-frequency", dts_value, len);
 		bus_hz = dts_value[0];
 	}
+	dwmmc_soc_diag(sc, "clock-frequency=%u max-frequency=%u\n",
+	    bus_hz, sc->host.f_max);
 
 	/* IP block reset is optional */
 	error = hwreset_get_by_ofw_name(sc->dev, 0, "reset", &sc->hwreset);
@@ -553,25 +689,22 @@ parse_fdt(struct dwmmc_softc *sc)
 		goto fail;
 	}
 
-	/* vmmc regulator is optional */
-	error = regulator_get_by_ofw_property(sc->dev, 0, "vmmc-supply",
-	     &sc->vmmc);
-	if (error != 0 &&
-	    error != ENOENT &&
-	    error != ENODEV) {
-		device_printf(sc->dev, "Cannot get regulator 'vmmc-supply'\n");
-		goto fail;
+	/* mmc_fdt_parse() owns the single consumer for each supply. */
+	error = sc->vmmc != NULL ? 0 : ENODEV;
+	if (dwmmc_soc_defer_missing_vmmc(sc, node, error)) {
+		dwmmc_release_supplies(sc);
+		return (EAGAIN);
 	}
+	dwmmc_soc_diag(sc, "vmmc-supply get error=%d present=%d\n",
+	    error, sc->vmmc != NULL);
 
-	/* vqmmc regulator is optional */
-	error = regulator_get_by_ofw_property(sc->dev, 0, "vqmmc-supply",
-	     &sc->vqmmc);
-	if (error != 0 &&
-	    error != ENOENT &&
-	    error != ENODEV) {
-		device_printf(sc->dev, "Cannot get regulator 'vqmmc-supply'\n");
-		goto fail;
+	error = sc->vqmmc != NULL ? 0 : ENODEV;
+	if (dwmmc_soc_defer_missing_vqmmc(sc, node, error)) {
+		dwmmc_release_supplies(sc);
+		return (EAGAIN);
 	}
+	dwmmc_soc_diag(sc, "vqmmc-supply get error=%d present=%d\n",
+	    error, sc->vqmmc != NULL);
 
 	/* Assert reset first */
 	if (sc->hwreset != NULL) {
@@ -590,6 +723,8 @@ parse_fdt(struct dwmmc_softc *sc)
 		device_printf(sc->dev, "Cannot get 'biu' clock\n");
 		goto fail;
 	}
+	dwmmc_soc_diag(sc, "biu clock get error=%d present=%d\n",
+	    error, sc->biu != NULL);
 
 	if (sc->biu) {
 		error = clk_enable(sc->biu);
@@ -610,6 +745,8 @@ parse_fdt(struct dwmmc_softc *sc)
 		device_printf(sc->dev, "Cannot get 'ciu' clock\n");
 		goto fail;
 	}
+	dwmmc_soc_diag(sc, "ciu clock get error=%d present=%d\n",
+	    error, sc->ciu != NULL);
 
 	if (sc->ciu) {
 		if (bus_hz != 0) {
@@ -623,24 +760,14 @@ parse_fdt(struct dwmmc_softc *sc)
 			device_printf(sc->dev, "cannot enable ciu clock\n");
 			goto fail;
 		}
-		clk_get_freq(sc->ciu, &sc->bus_hz);
+		error = clk_get_freq(sc->ciu, &sc->bus_hz);
+		dwmmc_soc_diag(sc,
+		    "ciu clock freq error=%d bus_hz=%ju\n", error,
+		    (uintmax_t)sc->bus_hz);
 	}
-
-	/* Enable regulators */
-	if (sc->vmmc != NULL) {
-		error = regulator_enable(sc->vmmc);
-		if (error != 0) {
-			device_printf(sc->dev, "Cannot enable vmmc regulator\n");
-			goto fail;
-		}
-	}
-	if (sc->vqmmc != NULL) {
-		error = regulator_enable(sc->vqmmc);
-		if (error != 0) {
-			device_printf(sc->dev, "Cannot enable vqmmc regulator\n");
-			goto fail;
-		}
-	}
+	if (sc->ciu == NULL && bus_hz != 0)
+		sc->bus_hz = bus_hz;
+	dwmmc_soc_fallback_bus_hz(sc);
 
 	/* Take dwmmc out of reset */
 	if (sc->hwreset != NULL) {
@@ -655,10 +782,13 @@ parse_fdt(struct dwmmc_softc *sc)
 		device_printf(sc->dev, "No bus speed provided\n");
 		goto fail;
 	}
+	dwmmc_soc_diag(sc, "parse done bus_hz=%ju f_min=%u f_max=%u\n",
+	    (uintmax_t)sc->bus_hz, sc->host.f_min, sc->host.f_max);
 
 	return (0);
 
 fail:
+	dwmmc_release_supplies(sc);
 	return (ENXIO);
 }
 
@@ -677,11 +807,13 @@ dwmmc_attach(device_t dev)
 
 	error = parse_fdt(sc);
 	if (error != 0) {
-		device_printf(dev, "Can't get FDT property.\n");
-		return (ENXIO);
+		if (error != EAGAIN)
+			device_printf(dev, "Can't get FDT property.\n");
+		return (error);
 	}
 
 	DWMMC_LOCK_INIT(sc);
+	callout_init_mtx(&sc->cmd11_callout, &sc->sc_mtx, 0);
 
 	if (bus_alloc_resources(dev, dwmmc_spec, sc->res)) {
 		device_printf(dev, "could not allocate resources\n");
@@ -715,7 +847,7 @@ dwmmc_attach(device_t dev)
 	}
 
 	if (!sc->use_pio) {
-		dma_stop(sc);
+		dma_stop(sc, false);
 		if (dma_setup(sc))
 			return (ENXIO);
 
@@ -746,10 +878,15 @@ dwmmc_attach(device_t dev)
 				   DWMMC_ERR_FLAGS |
 				   SDMMC_INTMASK_CD));
 	WRITE4(sc, SDMMC_CTRL, SDMMC_CTRL_INT_ENABLE);
-
 	TASK_INIT(&sc->card_task, 0, dwmmc_card_task, sc);
 	TIMEOUT_TASK_INIT(taskqueue_bus, &sc->card_delayed_task, 0,
 		dwmmc_card_task, sc);
+
+	if (sc->safe_power_cycle) {
+		error = dwmmc_set_safe_power_off(dev, "initial");
+		if (error != 0)
+			return (error);
+	}
 
 #ifdef MMCCAM
 	sc->ccb = NULL;
@@ -781,6 +918,7 @@ dwmmc_detach(device_t dev)
 
 	taskqueue_drain(taskqueue_bus, &sc->card_task);
 	taskqueue_drain_timeout(taskqueue_bus, &sc->card_delayed_task);
+	callout_drain(&sc->cmd11_callout);
 
 	if (sc->intr_cookie != NULL) {
 		ret = bus_teardown_intr(dev, sc->res[1], sc->intr_cookie);
@@ -798,10 +936,7 @@ dwmmc_detach(device_t dev)
 	if (sc->ciu != NULL && clk_disable(sc->ciu) != 0)
 			device_printf(sc->dev, "cannot disable ciu clock\n");
 
-	if (sc->vmmc && regulator_disable(sc->vmmc) != 0)
-		device_printf(sc->dev, "Cannot disable vmmc regulator\n");
-	if (sc->vqmmc && regulator_disable(sc->vqmmc) != 0)
-		device_printf(sc->dev, "Cannot disable vqmmc regulator\n");
+	dwmmc_release_supplies(sc);
 
 #ifdef MMCCAM
 	mmc_cam_sim_free(&sc->mmc_sim);
@@ -811,15 +946,65 @@ dwmmc_detach(device_t dev)
 }
 
 static int
+dwmmc_set_safe_power_off(device_t dev, const char *reason)
+{
+	struct dwmmc_softc *sc;
+	struct mmc_ios *ios;
+	uint32_t delay_ms;
+	int error, rv;
+	int vmmc_after, vmmc_before;
+
+	sc = device_get_softc(dev);
+	ios = &sc->host.ios;
+	vmmc_before = -1;
+	vmmc_after = -1;
+	if (sc->vmmc != NULL)
+		(void)regulator_status(sc->vmmc, &vmmc_before);
+	error = dwmmc_setup_bus(sc, 0) == 0 ? 0 : EIO;
+	ios->clock = 0;
+	ios->bus_width = bus_width_1;
+	ios->timing = bus_timing_normal;
+	ios->vccq = vccq_330;
+	rv = dwmmc_switch_vccq(dev, NULL);
+	if (error == 0)
+		error = rv;
+	ios->power_mode = power_off;
+	rv = dwmmc_update_ios(dev, NULL);
+	if (error == 0)
+		error = rv;
+	if (sc->vmmc != NULL)
+		(void)regulator_status(sc->vmmc, &vmmc_after);
+	delay_ms = MAX(sc->power_off_delay_ms, 1);
+	pause_sbt("dwmmcoff", delay_ms * SBT_1MS, 0, C_HARDCLOCK);
+
+	device_printf(dev, "%s state: clock off, VCCQ 3.3 V, "
+	    "VMMC=%d->%d, off-delay=%ums, error=%d\n",
+	    reason, vmmc_before, vmmc_after, delay_ms, error);
+	return (error);
+}
+
+int
+dwmmc_prepare_reboot(device_t dev)
+{
+
+	return (dwmmc_set_safe_power_off(dev, "reboot"));
+}
+
+static int
 dwmmc_setup_bus(struct dwmmc_softc *sc, int freq)
 {
+	uint32_t cmd;
 	int tout;
 	int div;
 
+	cmd = SDMMC_CMD_WAIT_PRVDATA | SDMMC_CMD_UPD_CLK_ONLY |
+	    SDMMC_CMD_START;
+	if (sc->voltage_switch)
+		cmd |= SDMMC_CMD_VOLT_SWITCH;
+
 	if (freq == 0) {
 		WRITE4(sc, SDMMC_CLKENA, 0);
-		WRITE4(sc, SDMMC_CMD, (SDMMC_CMD_WAIT_PRVDATA |
-			SDMMC_CMD_UPD_CLK_ONLY | SDMMC_CMD_START));
+		WRITE4(sc, SDMMC_CMD, cmd);
 
 		tout = 1000;
 		do {
@@ -838,8 +1023,7 @@ dwmmc_setup_bus(struct dwmmc_softc *sc, int freq)
 	div = (sc->bus_hz != freq) ? DIV_ROUND_UP(sc->bus_hz, 2 * freq) : 0;
 
 	WRITE4(sc, SDMMC_CLKDIV, div);
-	WRITE4(sc, SDMMC_CMD, (SDMMC_CMD_WAIT_PRVDATA |
-			SDMMC_CMD_UPD_CLK_ONLY | SDMMC_CMD_START));
+	WRITE4(sc, SDMMC_CMD, cmd);
 
 	tout = 1000;
 	do {
@@ -850,8 +1034,7 @@ dwmmc_setup_bus(struct dwmmc_softc *sc, int freq)
 	} while (READ4(sc, SDMMC_CMD) & SDMMC_CMD_START);
 
 	WRITE4(sc, SDMMC_CLKENA, (SDMMC_CLKENA_CCLK_EN | SDMMC_CLKENA_LP));
-	WRITE4(sc, SDMMC_CMD, SDMMC_CMD_WAIT_PRVDATA |
-			SDMMC_CMD_UPD_CLK_ONLY | SDMMC_CMD_START);
+	WRITE4(sc, SDMMC_CMD, cmd);
 
 	tout = 1000;
 	do {
@@ -860,6 +1043,7 @@ dwmmc_setup_bus(struct dwmmc_softc *sc, int freq)
 			return (1);
 		}
 	} while (READ4(sc, SDMMC_CMD) & SDMMC_CMD_START);
+	sc->voltage_switch = false;
 
 	return (0);
 }
@@ -870,26 +1054,53 @@ dwmmc_update_ios(device_t brdev, device_t reqdev)
 	struct dwmmc_softc *sc;
 	struct mmc_ios *ios;
 	uint32_t reg;
-	int ret = 0;
+	int ret, rv;
 
 	sc = device_get_softc(brdev);
 	ios = &sc->host.ios;
+	ret = 0;
 
 	dprintf("Setting up clk %u bus_width %d, timing: %d\n",
 		ios->clock, ios->bus_width, ios->timing);
 
 	switch (ios->power_mode) {
 	case power_on:
+		rv = mmc_fdt_set_power(&sc->mmc_helper, power_on);
+		if (ret == 0)
+			ret = rv;
+		if (sc->need_power_on_reset) {
+			if (dwmmc_ctrl_reset(sc, SDMMC_CTRL_RESET |
+			    SDMMC_CTRL_FIFO_RESET | SDMMC_CTRL_DMA_RESET) != 0)
+				ret = EIO;
+			else
+				sc->need_power_on_reset = false;
+		}
 		break;
 	case power_off:
+		if (dwmmc_setup_bus(sc, 0) != 0)
+			ret = EIO;
+		if (sc->safe_power_cycle && ios->vccq != vccq_330) {
+			ios->vccq = vccq_330;
+			rv = dwmmc_switch_vccq(brdev, NULL);
+			if (ret == 0)
+				ret = rv;
+		}
+		rv = mmc_fdt_set_power(&sc->mmc_helper, power_off);
+		if (ret == 0)
+			ret = rv;
 		WRITE4(sc, SDMMC_PWREN, 0);
 		break;
 	case power_up:
+		if (sc->power_off_delay_ms != 0)
+			pause_sbt("dwmmcpwr", sc->power_off_delay_ms * SBT_1MS,
+			    0, C_HARDCLOCK);
+		rv = mmc_fdt_set_power(&sc->mmc_helper, power_up);
+		if (ret == 0)
+			ret = rv;
 		WRITE4(sc, SDMMC_PWREN, 1);
+		sc->need_power_on_reset = true;
 		break;
 	}
-
-	mmc_fdt_set_power(&sc->mmc_helper, ios->power_mode);
 
 	if (ios->bus_width == bus_width_8)
 		WRITE4(sc, SDMMC_CTYPE, SDMMC_CTYPE_8BIT);
@@ -916,7 +1127,9 @@ dwmmc_update_ios(device_t brdev, device_t reqdev)
 	if (sc->update_ios)
 		ret = sc->update_ios(sc, ios);
 
-	dwmmc_setup_bus(sc, ios->clock);
+	if (ios->power_mode != power_off &&
+	    dwmmc_setup_bus(sc, ios->clock) != 0 && ret == 0)
+		ret = EIO;
 
 	return (ret);
 }
@@ -944,21 +1157,30 @@ dma_done(struct dwmmc_softc *sc, struct mmc_command *cmd)
 }
 
 static int
-dma_stop(struct dwmmc_softc *sc)
+dma_stop(struct dwmmc_softc *sc, bool reset_controller)
 {
-	int reg;
+	int i, reg;
 
 	reg = READ4(sc, SDMMC_CTRL);
-	reg &= ~(SDMMC_CTRL_USE_IDMAC);
-	reg |= (SDMMC_CTRL_DMA_RESET);
+	reg &= ~SDMMC_CTRL_USE_IDMAC;
 	WRITE4(sc, SDMMC_CTRL, reg);
+	if (dwmmc_ctrl_reset(sc, (reset_controller ? SDMMC_CTRL_RESET : 0) |
+	    SDMMC_CTRL_FIFO_RESET |
+	    SDMMC_CTRL_DMA_RESET) != 0)
+		return (1);
 
 	reg = READ4(sc, SDMMC_BMOD);
 	reg &= ~(SDMMC_BMOD_DE | SDMMC_BMOD_FB);
 	reg |= (SDMMC_BMOD_SWR);
 	WRITE4(sc, SDMMC_BMOD, reg);
+	for (i = 0; i < 1000; i++) {
+		if ((READ4(sc, SDMMC_BMOD) & SDMMC_BMOD_SWR) == 0)
+			return (0);
+		DELAY(10);
+	}
+	device_printf(sc->dev, "IDMAC reset failed\n");
 
-	return (0);
+	return (1);
 }
 
 static int
@@ -1092,6 +1314,8 @@ dwmmc_start_cmd(struct dwmmc_softc *sc, struct mmc_command *cmd)
 	struct mmc_data *data;
 	uint32_t blksz;
 	uint32_t cmdr;
+	uint32_t reg;
+	int tout;
 
 	dprintf("%s\n", __func__);
 	sc->curcmd = cmd;
@@ -1123,6 +1347,26 @@ dwmmc_start_cmd(struct dwmmc_softc *sc, struct mmc_command *cmd)
 
 	if (cmd->flags & MMC_RSP_CRC)
 		cmdr |= SDMMC_CMD_RESP_CRC;
+
+	if (cmd->opcode == SD_SWITCH_VOLTAGE) {
+		reg = READ4(sc, SDMMC_CLKENA);
+		WRITE4(sc, SDMMC_CLKENA, reg & ~SDMMC_CLKENA_LP);
+		WRITE4(sc, SDMMC_CMD, SDMMC_CMD_WAIT_PRVDATA |
+		    SDMMC_CMD_UPD_CLK_ONLY | SDMMC_CMD_START);
+		for (tout = 1000; tout >= 0; tout--) {
+			if ((READ4(sc, SDMMC_CMD) & SDMMC_CMD_START) == 0)
+				break;
+		}
+		if (tout < 0) {
+			device_printf(sc->dev,
+			    "failed to disable low-power clock for CMD11\n");
+			cmd->error = MMC_ERR_TIMEOUT;
+		}
+		sc->voltage_switch = true;
+		cmdr |= SDMMC_CMD_VOLT_SWITCH;
+		WRITE4(sc, SDMMC_INTMASK, READ4(sc, SDMMC_INTMASK) |
+		    SDMMC_INTMASK_VOLT_SWITCH);
+	}
 
 	/*
 	 * XXX: Not all platforms want this.
@@ -1173,12 +1417,21 @@ dwmmc_start_cmd(struct dwmmc_softc *sc, struct mmc_command *cmd)
 	WRITE4(sc, SDMMC_CMDARG, cmd->arg);
 	wmb();
 	WRITE4(sc, SDMMC_CMD, cmdr | SDMMC_CMD_START);
+	if (cmd->opcode == SD_SWITCH_VOLTAGE)
+		callout_reset(&sc->cmd11_callout, MAX(1, hz / 2),
+		    dwmmc_cmd_timeout, sc);
+	else if (cmd->opcode == MMC_SEND_TUNING_BLOCK)
+		callout_reset(&sc->cmd11_callout, hz, dwmmc_cmd_timeout, sc);
+	else if (cmd->opcode == MMC_STOP_TRANSMISSION)
+		callout_reset(&sc->cmd11_callout, hz, dwmmc_cmd_timeout, sc);
 };
 
 static void
 dwmmc_next_operation(struct dwmmc_softc *sc)
 {
 	struct mmc_command *cmd;
+	uint32_t status;
+	int busy_timeout;
 	dprintf("%s\n", __func__);
 #ifdef MMCCAM
 	union ccb *ccb;
@@ -1193,31 +1446,56 @@ dwmmc_next_operation(struct dwmmc_softc *sc)
 	req = sc->req;
 	if (req == NULL)
 		return;
-	cmd = req->cmd;
+	cmd = sc->curcmd;
 #endif
 
 	sc->acd_rcvd = 0;
 	sc->dto_rcvd = 0;
 	sc->cmd_done = 0;
 
-	/*
-	 * XXX: Wait until card is still busy.
-	 * We do need this to prevent data timeouts,
-	 * mostly caused by multi-block write command
-	 * followed by single-read.
-	 */
-	while(READ4(sc, SDMMC_STATUS) & (SDMMC_STATUS_DATA_BUSY))
-		continue;
-
+#ifndef MMCCAM
+	if (sc->flags & PENDING_CMD) {
+		sc->flags &= ~PENDING_CMD;
+		dwmmc_start_cmd(sc, req->cmd);
+		return;
+	}
+	if ((sc->flags & PENDING_STOP) != 0 &&
+	    (!sc->use_auto_stop || req->cmd->error != MMC_ERR_NONE)) {
+		sc->flags &= ~PENDING_STOP;
+		dwmmc_start_cmd(sc, req->stop);
+		return;
+	}
+	sc->flags &= ~PENDING_STOP;
+#else
 	if (sc->flags & PENDING_CMD) {
 		sc->flags &= ~PENDING_CMD;
 		dwmmc_start_cmd(sc, cmd);
 		return;
-	} else if (sc->flags & PENDING_STOP && !sc->use_auto_stop) {
-		sc->flags &= ~PENDING_STOP;
-		/// XXX: What to do with this?
-		//dwmmc_start_cmd(sc, req->stop);
-		return;
+	}
+#endif
+
+	/*
+	 * Wait until the card is no longer busy, but never spin forever.
+	 * The error path sends CMD12 above before waiting here.  This also
+	 * prevents data timeouts,
+	 * mostly caused by multi-block write command
+	 * followed by single-read.
+	 */
+	status = 0;
+	if (cmd != NULL && cmd->opcode != SD_SWITCH_VOLTAGE) {
+		status = READ4(sc, SDMMC_STATUS);
+		for (busy_timeout = 100000;
+		    (status & SDMMC_STATUS_DATA_BUSY) != 0 &&
+		    busy_timeout > 0; busy_timeout--) {
+			DELAY(10);
+			status = READ4(sc, SDMMC_STATUS);
+		}
+		if ((status & SDMMC_STATUS_DATA_BUSY) != 0) {
+			device_printf(sc->dev,
+			    "DATA_BUSY did not clear after CMD%u\n",
+			    cmd->opcode);
+			cmd->error = MMC_ERR_TIMEOUT;
+		}
 	}
 
 #ifdef MMCCAM
@@ -1227,6 +1505,24 @@ dwmmc_next_operation(struct dwmmc_softc *sc)
 		(ccb->mmcio.cmd.error == 0 ? CAM_REQ_CMP : CAM_REQ_CMP_ERR);
 	xpt_done(ccb);
 #else
+	if ((sc->flags & RETRY_CMD) != 0) {
+		sc->flags &= ~RETRY_CMD;
+		if (cmd == req->stop && cmd->error == MMC_ERR_NONE &&
+		    (status & SDMMC_STATUS_DATA_BUSY) == 0 &&
+		    dwmmc_setup_bus(sc, sc->host.ios.clock) == 0) {
+			req->cmd->retries++;
+			req->cmd->error = MMC_ERR_NONE;
+			req->stop->error = MMC_ERR_NONE;
+			sc->flags |= PENDING_STOP;
+			device_printf(sc->dev,
+			    "CMD18 recovered with CMD12; retrying read once\n");
+			dwmmc_start_cmd(sc, req->cmd);
+			return;
+		}
+		device_printf(sc->dev,
+		    "CMD18 recovery failed; read will not be retried\n");
+	}
+	sc->flags &= ~(PENDING_CMD | PENDING_STOP | RETRY_CMD);
 	sc->req = NULL;
 	sc->curcmd = NULL;
 	req->done(req);
@@ -1253,6 +1549,7 @@ dwmmc_request(device_t brdev, device_t reqdev, struct mmc_request *req)
 	}
 
 	sc->req = req;
+	sc->flags &= ~(PENDING_CMD | PENDING_STOP | RETRY_CMD);
 	sc->flags |= PENDING_CMD;
 	if (sc->req->stop)
 		sc->flags |= PENDING_STOP;
@@ -1265,12 +1562,32 @@ dwmmc_request(device_t brdev, device_t reqdev, struct mmc_request *req)
 
 #ifndef MMCCAM
 static int
+dwmmc_tune(device_t brdev, device_t reqdev, bool hs400)
+{
+	struct dwmmc_softc *sc;
+
+	sc = device_get_softc(brdev);
+	if (sc->tune != NULL)
+		return (sc->tune(sc, reqdev, hs400));
+	return (0);
+}
+
+static int
 dwmmc_get_ro(device_t brdev, device_t reqdev)
 {
 
 	dprintf("%s\n", __func__);
 
 	return (0);
+}
+
+static int
+dwmmc_card_busy(device_t brdev, device_t reqdev __unused)
+{
+	struct dwmmc_softc *sc;
+
+	sc = device_get_softc(brdev);
+	return ((READ4(sc, SDMMC_STATUS) & SDMMC_STATUS_DATA_BUSY) != 0);
 }
 
 static int
@@ -1413,15 +1730,51 @@ dwmmc_write_ivar(device_t bus, device_t child, int which, uintptr_t value)
 	return (0);
 }
 
-#ifdef MMCCAM
-/* Note: this function likely belongs to the specific driver impl */
 static int
-dwmmc_switch_vccq(device_t dev, device_t child)
+dwmmc_switch_vccq(device_t dev, device_t child __unused)
 {
-	device_printf(dev, "This is a default impl of switch_vccq() that always fails\n");
-	return EINVAL;
+	struct dwmmc_softc *sc;
+	uint32_t reg;
+	int error, uvolt;
+
+	sc = device_get_softc(dev);
+	switch (sc->host.ios.vccq) {
+	case vccq_120:
+		uvolt = 1200000;
+		break;
+	case vccq_180:
+		uvolt = 1800000;
+		break;
+	case vccq_330:
+		uvolt = 3300000;
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	if (sc->vqmmc != NULL) {
+		error = regulator_set_voltage(sc->vqmmc, uvolt, uvolt);
+		if (error != 0) {
+			device_printf(dev, "cannot set vqmmc to %d uV: %d\n",
+			    uvolt, error);
+			return (error);
+		}
+	}
+
+	reg = READ4(sc, SDMMC_UHS_REG);
+	if (sc->host.ios.vccq == vccq_330)
+		reg &= ~SDMMC_UHS_REG_18V;
+	else
+		reg |= SDMMC_UHS_REG_18V;
+	WRITE4(sc, SDMMC_UHS_REG, reg);
+	if (bootverbose)
+		device_printf(dev, "VCCQ set to %d uV (UHS_REG=%#x)\n",
+		    uvolt, reg);
+
+	return (0);
 }
 
+#ifdef MMCCAM
 static int
 dwmmc_get_tran_settings(device_t dev, struct ccb_trans_settings_mmc *cts)
 {
@@ -1493,7 +1846,8 @@ dwmmc_set_tran_settings(device_t dev, struct ccb_trans_settings_mmc *cts)
 		if (bootverbose)
 			device_printf(sc->dev, "VCCQ => %d\n", ios->vccq);
 		res = dwmmc_switch_vccq(sc->dev, NULL);
-		device_printf(sc->dev, "VCCQ switch result: %d\n", res);
+		if (res != 0)
+			return (res);
 	}
 
 	return (dwmmc_update_ios(sc->dev, NULL));
@@ -1554,6 +1908,9 @@ static device_method_t dwmmc_methods[] = {
 	DEVMETHOD(mmcbr_update_ios,	dwmmc_update_ios),
 	DEVMETHOD(mmcbr_request,	dwmmc_request),
 	DEVMETHOD(mmcbr_get_ro,		dwmmc_get_ro),
+	DEVMETHOD(mmcbr_card_busy,	dwmmc_card_busy),
+	DEVMETHOD(mmcbr_switch_vccq,	dwmmc_switch_vccq),
+	DEVMETHOD(mmcbr_tune,		dwmmc_tune),
 	DEVMETHOD(mmcbr_acquire_host,	dwmmc_acquire_host),
 	DEVMETHOD(mmcbr_release_host,	dwmmc_release_host),
 #endif

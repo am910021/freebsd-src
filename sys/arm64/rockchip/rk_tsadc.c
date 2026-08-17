@@ -47,6 +47,7 @@
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/hwreset/hwreset.h>
 #include <dev/extres/syscon/syscon.h>
+#include <dev/fdt/simplebus.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
@@ -57,6 +58,7 @@
 #define	TSADC_V2				1
 #define	TSADC_V3				2
 #define	TSADC_V7				3
+#define	TSADC_V8				4
 
 /* Global registers */
 #define	TSADC_USER_CON				0x000
@@ -70,16 +72,38 @@
 #define	 TSADC_INT_EN_2CRU_EN_SRC(x)			(1 << (8 + (x)))
 #define	 TSADC_INT_EN_2GPIO_EN_SRC(x)			(1 << (4 + (x)))
 #define	TSADC_INT_PD				0x00c
+#define	TSADC_V3_AUTO_SRC_CON			0x00c
+#define	TSADC_V3_HT_INT_EN			0x014
+#define	TSADC_V3_HSHUT_GPIO_INT_EN		0x018
+#define	TSADC_V3_HSHUT_CRU_INT_EN		0x01c
+#define	TSADC_V3_INT_PD			0x024
+#define	TSADC_V3_HSHUT_PD			0x028
 #define	TSADC_DATA(x)				(0x20 + (x) * 0x04)
+#define	TSADC_V3_DATA(x)			(0x2c + (x) * 0x04)
 #define	TSADC_COMP_INT(x)			(0x30 + (x) * 0x04)
 #define	 TSADC_COMP_INT_SRC_EN(x)			(1 << (0 + (x)))
 #define	TSADC_COMP_SHUT(x)			(0x40 + (x) * 0x04)
+#define	TSADC_V3_COMP_INT(x)			(0x6c + (x) * 0x04)
+#define	TSADC_V3_COMP_SHUT(x)			(0x10c + (x) * 0x04)
 #define	TSADC_HIGHT_INT_DEBOUNCE		0x060
 #define	TSADC_HIGHT_TSHUT_DEBOUNCE		0x064
 #define	TSADC_AUTO_PERIOD			0x068
 #define	TSADC_AUTO_PERIOD_HT			0x06c
+#define	TSADC_V3_HIGHT_INT_DEBOUNCE		0x14c
+#define	TSADC_V3_HIGHT_TSHUT_DEBOUNCE		0x150
+#define	TSADC_V3_AUTO_PERIOD			0x154
+#define	TSADC_V3_AUTO_PERIOD_HT		0x158
 #define	TSADC_COMP0_LOW_INT			0x080	/* V3 only */
 #define	TSADC_COMP1_LOW_INT			0x084	/* V3 only */
+
+#define	TSADC_AUTO_CON_AUTO_MASK		(1 << 16)
+#define	TSADC_AUTO_CON_POL_HI_MASK		(1 << 24)
+#define	TSADC_V3_AUTO_SRC_EN(x)		(1 << (x))
+#define	TSADC_V3_AUTO_SRC_EN_MASK(x)		(1 << (16 + (x)))
+#define	TSADC_V3_INT_SRC_EN(x)			(1 << (x))
+#define	TSADC_V3_INT_SRC_EN_MASK(x)		(1 << (16 + (x)))
+#define	TSADC_V4_INT_PD_CLEAR_MASK		0xffffffff
+#define	TSADC_V4_DATA_MASK			0x1ff
 
 /* V3 GFR registers */
 #define	GRF_SARADC_TESTBIT			0x0e644
@@ -118,6 +142,8 @@ struct tsadc_calib_info {
 	int			nentries;
 };
 
+struct tsadc_softc;
+
 struct tsadc_conf {
 	int			version;
 	int			q_sel_ntc;
@@ -127,6 +153,13 @@ struct tsadc_conf {
 	struct tsensor		*tsensors;
 	int			ntsensors;
 	struct tsadc_calib_info	calib_info;
+	void			(*init)(struct tsadc_softc *);
+	void			(*init_tsensor)(struct tsadc_softc *,
+				    struct tsensor *);
+	uint32_t		(*read_data)(struct tsadc_softc *,
+				    struct tsensor *);
+	int			(*intr)(struct tsadc_softc *);
+	uint32_t		auto_mode_enable;
 };
 
 struct tsadc_softc {
@@ -148,6 +181,11 @@ struct tsadc_softc {
 
 	int			alarm_temp;
 };
+
+static void tsadc_init_v8(struct tsadc_softc *);
+static void tsadc_init_tsensor_v8(struct tsadc_softc *, struct tsensor *);
+static uint32_t tsadc_read_data_v8(struct tsadc_softc *, struct tsensor *);
+static int tsadc_intr_v8(struct tsadc_softc *);
 
 static struct rk_calib_entry rk3288_calib_data[] = {
 	{3800, -40000},
@@ -354,9 +392,28 @@ static struct rk_calib_entry rk3568_calib_data[] = {
 	{2704, 125000},
 };
 
+static struct rk_calib_entry rk3588_calib_data[] = {
+	{0, -40000},
+	{215, -40000},
+	{285, 25000},
+	{350, 85000},
+	{395, 125000},
+	{TSADC_V4_DATA_MASK, 125000},
+};
+
 static struct tsensor rk3568_tsensors[] = {
 	{ .channel = 0, .id = 0, .name = "CPU"},
 	{ .channel = 1, .id = 1, .name = "GPU"},
+};
+
+static struct tsensor rk3588_tsensors[] = {
+	{ .channel = 0, .id = 0, .name = "top"},
+	{ .channel = 1, .id = 1, .name = "big_core0"},
+	{ .channel = 2, .id = 2, .name = "big_core1"},
+	{ .channel = 3, .id = 3, .name = "little_core"},
+	{ .channel = 4, .id = 4, .name = "center"},
+	{ .channel = 5, .id = 5, .name = "gpu"},
+	{ .channel = 6, .id = 6, .name = "npu"},
 };
 
 static struct tsadc_conf rk3568_tsadc_conf = {
@@ -373,11 +430,31 @@ static struct tsadc_conf rk3568_tsadc_conf = {
 	}
 };
 
+static struct tsadc_conf rk3588_tsadc_conf = {
+	.version =		TSADC_V8,
+	.q_sel_ntc =		0,
+	.shutdown_temp =	95000,
+	.shutdown_mode =	1, /* GPIO */
+	.shutdown_pol =		0, /* Low  */
+	.tsensors =		rk3588_tsensors,
+	.ntsensors =		nitems(rk3588_tsensors),
+	.calib_info =	{
+			.table = rk3588_calib_data,
+			.nentries = nitems(rk3588_calib_data),
+	},
+	.init =			tsadc_init_v8,
+	.init_tsensor =		tsadc_init_tsensor_v8,
+	.read_data =		tsadc_read_data_v8,
+	.intr =			tsadc_intr_v8,
+	.auto_mode_enable =	TSADC_AUTO_CON_AUTO | TSADC_AUTO_CON_AUTO_MASK,
+};
+
 static struct ofw_compat_data compat_data[] = {
 	{"rockchip,rk3288-tsadc",	(uintptr_t)&rk3288_tsadc_conf},
 	{"rockchip,rk3328-tsadc",	(uintptr_t)&rk3328_tsadc_conf},
 	{"rockchip,rk3399-tsadc",	(uintptr_t)&rk3399_tsadc_conf},
 	{"rockchip,rk3568-tsadc",	(uintptr_t)&rk3568_tsadc_conf},
+	{"rockchip,rk3588-tsadc",	(uintptr_t)&rk3588_tsadc_conf},
 	{NULL,		0}
 };
 
@@ -467,7 +544,7 @@ tsadc_raw_to_temp(struct tsadc_softc *sc, uint32_t raw)
 }
 
 static void
-tsadc_init_tsensor(struct tsadc_softc *sc, struct tsensor *sensor)
+tsadc_init_tsensor_default(struct tsadc_softc *sc, struct tsensor *sensor)
 {
 	uint32_t val;
 
@@ -499,11 +576,51 @@ tsadc_init_tsensor(struct tsadc_softc *sc, struct tsensor *sensor)
 }
 
 static void
-tsadc_init(struct tsadc_softc *sc)
+tsadc_init_tsensor_v8(struct tsadc_softc *sc, struct tsensor *sensor)
 {
 	uint32_t val;
 
-	/* Common part */
+	if (sc->shutdown_mode != 0) {
+		WR4(sc, TSADC_V3_HSHUT_GPIO_INT_EN,
+		    TSADC_V3_INT_SRC_EN(sensor->channel) |
+		    TSADC_V3_INT_SRC_EN_MASK(sensor->channel));
+		WR4(sc, TSADC_V3_HSHUT_CRU_INT_EN,
+		    TSADC_V3_INT_SRC_EN_MASK(sensor->channel));
+	} else {
+		WR4(sc, TSADC_V3_HSHUT_CRU_INT_EN,
+		    TSADC_V3_INT_SRC_EN(sensor->channel) |
+		    TSADC_V3_INT_SRC_EN_MASK(sensor->channel));
+		WR4(sc, TSADC_V3_HSHUT_GPIO_INT_EN,
+		    TSADC_V3_INT_SRC_EN_MASK(sensor->channel));
+	}
+
+	val = tsadc_temp_to_raw(sc, sc->shutdown_temp);
+	WR4(sc, TSADC_V3_COMP_SHUT(sensor->channel), val);
+	WR4(sc, TSADC_V3_AUTO_SRC_CON,
+	    TSADC_V3_AUTO_SRC_EN(sensor->channel) |
+	    TSADC_V3_AUTO_SRC_EN_MASK(sensor->channel));
+
+	val = tsadc_temp_to_raw(sc, sc->alarm_temp);
+	WR4(sc, TSADC_V3_COMP_INT(sensor->channel), val);
+	WR4(sc, TSADC_V3_HT_INT_EN,
+	    TSADC_V3_INT_SRC_EN(sensor->channel) |
+	    TSADC_V3_INT_SRC_EN_MASK(sensor->channel));
+}
+
+static void
+tsadc_init_tsensor(struct tsadc_softc *sc, struct tsensor *sensor)
+{
+	if (sc->conf->init_tsensor != NULL)
+		sc->conf->init_tsensor(sc, sensor);
+	else
+		tsadc_init_tsensor_default(sc, sensor);
+}
+
+static void
+tsadc_init_auto_con(struct tsadc_softc *sc)
+{
+	uint32_t val;
+
 	val = 0;	/* XXX Is this right? */
 	if (sc->shutdown_pol != 0)
 		val |= TSADC_AUTO_CON_POL_HI;
@@ -512,6 +629,12 @@ tsadc_init(struct tsadc_softc *sc)
 	if (sc->conf->q_sel_ntc)
 		val |= TSADC_AUTO_Q_SEL;
 	WR4(sc, TSADC_AUTO_CON, val);
+}
+
+static void
+tsadc_init_default(struct tsadc_softc *sc)
+{
+	tsadc_init_auto_con(sc);
 
 	switch (sc->conf->version) {
 	case TSADC_V2:
@@ -566,12 +689,58 @@ tsadc_init(struct tsadc_softc *sc)
 	}
 }
 
+static void
+tsadc_init_v8(struct tsadc_softc *sc)
+{
+	tsadc_init_auto_con(sc);
+
+	WR4(sc, TSADC_V3_AUTO_PERIOD, 5000);	/* 2.5ms */
+	WR4(sc, TSADC_V3_AUTO_PERIOD_HT, 5000);	/* 2.5ms */
+	WR4(sc, TSADC_V3_HIGHT_INT_DEBOUNCE, 4);
+	WR4(sc, TSADC_V3_HIGHT_TSHUT_DEBOUNCE, 4);
+	if (sc->shutdown_pol != 0)
+		WR4(sc, TSADC_AUTO_CON, TSADC_AUTO_CON_POL_HI |
+		    TSADC_AUTO_CON_POL_HI_MASK);
+	else
+		WR4(sc, TSADC_AUTO_CON, TSADC_AUTO_CON_POL_HI_MASK);
+}
+
+static void
+tsadc_init(struct tsadc_softc *sc)
+{
+	if (sc->conf->init != NULL)
+		sc->conf->init(sc);
+	else
+		tsadc_init_default(sc);
+}
+
+static uint32_t
+tsadc_read_data_default(struct tsadc_softc *sc, struct tsensor *sensor)
+{
+	return (RD4(sc, TSADC_DATA(sensor->channel)));
+}
+
+static uint32_t
+tsadc_read_data_v8(struct tsadc_softc *sc, struct tsensor *sensor)
+{
+	return (RD4(sc, TSADC_V3_DATA(sensor->channel)) &
+	    TSADC_V4_DATA_MASK);
+}
+
+static uint32_t
+tsadc_read_data(struct tsadc_softc *sc, struct tsensor *sensor)
+{
+	if (sc->conf->read_data != NULL)
+		return (sc->conf->read_data(sc, sensor));
+	return (tsadc_read_data_default(sc, sensor));
+}
+
 static int
 tsadc_read_temp(struct tsadc_softc *sc, struct tsensor *sensor, int *temp)
 {
 	uint32_t val;
 
-	val = RD4(sc, TSADC_DATA(sensor->channel));
+	val = tsadc_read_data(sc, sensor);
 	*temp = tsadc_raw_to_temp(sc, val);
 
 #ifdef DEBUG
@@ -661,12 +830,9 @@ tsadc_init_sysctl(struct tsadc_softc *sc)
 }
 
 static int
-tsadc_intr(void *arg)
+tsadc_intr_default(struct tsadc_softc *sc)
 {
-	struct tsadc_softc *sc;
 	uint32_t val;
-
-	sc = (struct tsadc_softc *)arg;
 
 	val = RD4(sc, TSADC_INT_PD);
 	WR4(sc, TSADC_INT_PD, val);
@@ -683,17 +849,90 @@ tsadc_intr(void *arg)
 }
 
 static int
+tsadc_intr_v8(struct tsadc_softc *sc)
+{
+	uint32_t val;
+
+	val = RD4(sc, TSADC_V3_INT_PD);
+	WR4(sc, TSADC_V3_INT_PD, val & TSADC_V4_INT_PD_CLEAR_MASK);
+	val = RD4(sc, TSADC_V3_HSHUT_PD);
+	WR4(sc, TSADC_V3_HSHUT_PD, val & TSADC_V4_INT_PD_CLEAR_MASK);
+	return (FILTER_HANDLED);
+}
+
+static int
+tsadc_intr(void *arg)
+{
+	struct tsadc_softc *sc;
+
+	sc = (struct tsadc_softc *)arg;
+
+	if (sc->conf->intr != NULL)
+		return (sc->conf->intr(sc));
+	return (tsadc_intr_default(sc));
+}
+
+static int
+tsadc_node_is_compatible(phandle_t node)
+{
+	int i;
+
+	for (i = 0; compat_data[i].ocd_str != NULL; i++) {
+		if (ofw_bus_node_is_compatible(node, compat_data[i].ocd_str))
+			return (1);
+	}
+
+	return (0);
+}
+
+static void
+tsadc_identify(driver_t *driver, device_t parent)
+{
+	phandle_t node;
+
+	if (device_find_child(parent, "rk_tsadc", -1) != NULL)
+		return;
+
+	for (node = OF_child(OF_peer(0)); node > 0; node = OF_peer(node)) {
+		if (!tsadc_node_is_compatible(node))
+			continue;
+		if (!ofw_bus_node_status_okay(node))
+			continue;
+		simplebus_add_device(parent, node, 1000, "rk_tsadc", -1, NULL);
+		return;
+	}
+}
+
+static int
 tsadc_probe(device_t dev)
 {
+	uintptr_t data;
+
+	data = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
+	if (data == 0)
 		return (ENXIO);
 
 	device_set_desc(dev, "RockChip temperature sensors");
 	return (BUS_PROBE_DEFAULT);
+}
+
+static int
+tsadc_get_clock(struct tsadc_softc *sc, phandle_t node, const char *name,
+    int idx, clk_t *clk)
+{
+	int rv;
+
+	rv = clk_get_by_ofw_name(sc->dev, node, name, clk);
+	if (rv == 0)
+		return (0);
+
+	rv = clk_get_by_ofw_index(sc->dev, node, idx, clk);
+
+	return (rv);
 }
 
 static int
@@ -739,12 +978,12 @@ tsadc_attach(device_t dev)
 		device_printf(dev, "Cannot get resets\n");
 		goto fail;
 	}
-	rv = clk_get_by_ofw_name(dev, 0, "tsadc", &sc->tsadc_clk);
+	rv = tsadc_get_clock(sc, node, "tsadc", 0, &sc->tsadc_clk);
 	if (rv != 0) {
 		device_printf(dev, "Cannot get 'tsadc' clock: %d\n", rv);
 		goto fail;
 	}
-	rv = clk_get_by_ofw_name(dev, 0, "apb_pclk", &sc->apb_pclk_clk);
+	rv = tsadc_get_clock(sc, node, "apb_pclk", 1, &sc->apb_pclk_clk);
 	if (rv != 0) {
 		device_printf(dev, "Cannot get 'apb_pclk' clock: %d\n", rv);
 		goto fail;
@@ -808,7 +1047,10 @@ tsadc_attach(device_t dev)
 
 	/* Enable auto mode */
 	val = RD4(sc, TSADC_AUTO_CON);
-	val |= TSADC_AUTO_CON_AUTO;
+	if (sc->conf->auto_mode_enable != 0)
+		val |= sc->conf->auto_mode_enable;
+	else
+		val |= TSADC_AUTO_CON_AUTO;
 	WR4(sc, TSADC_AUTO_CON, val);
 
 	rv = tsadc_init_sysctl(sc);
@@ -864,6 +1106,7 @@ tsadc_detach(device_t dev)
 
 static device_method_t rk_tsadc_methods[] = {
 	/* Device interface */
+	DEVMETHOD(device_identify,		tsadc_identify),
 	DEVMETHOD(device_probe,			tsadc_probe),
 	DEVMETHOD(device_attach,		tsadc_attach),
 	DEVMETHOD(device_detach,		tsadc_detach),
@@ -876,5 +1119,8 @@ static device_method_t rk_tsadc_methods[] = {
 
 static DEFINE_CLASS_0(rk_tsadc, rk_tsadc_driver, rk_tsadc_methods,
     sizeof(struct tsadc_softc));
+SIMPLEBUS_PNP_INFO(compat_data);
+OFWBUS_PNP_INFO(compat_data);
 EARLY_DRIVER_MODULE(rk_tsadc, simplebus, rk_tsadc_driver, NULL, NULL,
     BUS_PASS_TIMER + BUS_PASS_ORDER_LAST);
+DRIVER_MODULE(rk_tsadc, ofwbus, rk_tsadc_driver, NULL, NULL);

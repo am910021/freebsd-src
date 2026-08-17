@@ -269,8 +269,13 @@
 #define	CMD_TLBI_NH_ALL		0x10
 #define	CMD_TLBI_NH_ASID	0x11
 #define	CMD_TLBI_NH_VA		0x12
+#define	 TLBI_0_NUM_S		12
+#define	 TLBI_0_SCALE_S		20
+#define	 TLBI_0_VMID_S		32
 #define	 TLBI_0_ASID_S		48
 #define	 TLBI_1_LEAF		(1 << 0)
+#define	 TLBI_1_TTL_S		8
+#define	 TLBI_1_TG_S		10
 #define	 TLBI_1_ADDR_S		12
 #define	 TLBI_1_ADDR_M		(0xfffffffffffff << TLBI_1_ADDR_S)
 #define	CMD_TLBI_NH_VAA		0x13

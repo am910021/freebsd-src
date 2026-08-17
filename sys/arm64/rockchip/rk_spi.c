@@ -50,7 +50,9 @@
 
 #define	RK_SPI_CTRLR0		0x0000
 #define		CTRLR0_OPM_MASTER	(0 << 20)
+#define		CTRLR0_XFM_MASK	(3 << 18)
 #define		CTRLR0_XFM_TR		(0 << 18)
+#define		CTRLR0_XFM_RO		(2 << 18)
 #define		CTRLR0_FRF_MOTO		(0 << 16)
 #define		CTRLR0_BHT_8BIT		(1 << 13)
 #define		CTRLR0_EM_BIG		(1 << 11)
@@ -84,11 +86,14 @@
 #define	RK_SPI_RXDR		0x0800
 
 #define	CS_MAX			1
+#define	RK_SPI_MAX_TRANLEN	0xffff
+#define	RK_SPI_XFER_TIMEOUT_US	1000000
 
 static struct ofw_compat_data compat_data[] = {
 	{ "rockchip,rk3328-spi",		1 },
 	{ "rockchip,rk3399-spi",		1 },
 	{ "rockchip,rk3568-spi",		1 },
+	{ "rockchip,rk3588-spi",		1 },
 	{ NULL,					0 }
 };
 
@@ -209,11 +214,15 @@ rk_spi_fifo_size(struct rk_spi_softc *sc)
 static void
 rk_spi_empty_rxfifo(struct rk_spi_softc *sc)
 {
-	uint32_t rxlevel;
+	uint32_t rxlevel, value;
+
 	rxlevel = RK_SPI_READ_4(sc, RK_SPI_RXFLR);
 	while (sc->rxidx < sc->rxlen &&
 	    (rxlevel-- > 0)) {
-		sc->rxbuf[sc->rxidx++] = (uint8_t)RK_SPI_READ_4(sc, RK_SPI_RXDR);
+		value = RK_SPI_READ_4(sc, RK_SPI_RXDR);
+		if (sc->rxbuf != NULL)
+			sc->rxbuf[sc->rxidx] = (uint8_t)value;
+		sc->rxidx++;
 	}
 }
 
@@ -235,19 +244,40 @@ rk_spi_fill_txfifo(struct rk_spi_softc *sc)
 static int
 rk_spi_xfer_buf(struct rk_spi_softc *sc, void *rxbuf, void *txbuf, uint32_t len)
 {
-	int err;
+	uint32_t cr0, rxftlr;
+	int err, timeout;
 
 	if (len == 0)
 		return (0);
+	if (rxbuf == NULL && txbuf == NULL)
+		return (EINVAL);
+	if (len > RK_SPI_MAX_TRANLEN)
+		return (EFBIG);
+
+	/* CTRLR0, CTRLR1, and FIFO thresholds are writable only when idle. */
+	rk_spi_enable_chip(sc, 0);
+	cr0 = RK_SPI_READ_4(sc, RK_SPI_CTRLR0);
+	cr0 &= ~CTRLR0_XFM_MASK;
+	if (txbuf == NULL)
+		cr0 |= CTRLR0_XFM_RO;
+	RK_SPI_WRITE_4(sc, RK_SPI_CTRLR0, cr0);
+	RK_SPI_WRITE_4(sc, RK_SPI_CTRLR1, len - 1);
+	rxftlr = len < sc->fifo_size ? len - 1 : sc->fifo_size / 2 - 1;
+	RK_SPI_WRITE_4(sc, RK_SPI_RXFTLR, rxftlr);
+	RK_SPI_WRITE_4(sc, RK_SPI_IMR, 0);
+	RK_SPI_WRITE_4(sc, RK_SPI_ICR, UINT32_MAX);
 
 	sc->rxbuf = rxbuf;
 	sc->rxlen = len;
 	sc->rxidx = 0;
 	sc->txbuf = txbuf;
-	sc->txlen = len;
+	sc->txlen = txbuf == NULL ? 0 : len;
 	sc->txidx = 0;
 	sc->intreg = 0;
-	rk_spi_fill_txfifo(sc);
+
+	rk_spi_enable_chip(sc, 1);
+	if (txbuf != NULL)
+		rk_spi_fill_txfifo(sc);
 
 	RK_SPI_WRITE_4(sc, RK_SPI_IMR, sc->intreg);
 
@@ -255,13 +285,28 @@ rk_spi_xfer_buf(struct rk_spi_softc *sc, void *rxbuf, void *txbuf, uint32_t len)
 	while (err == 0 && sc->intreg != 0)
 		err = msleep(sc, &sc->mtx, 0, "rk_spi", 10 * hz);
 
-	while (err == 0 && sc->rxidx != sc->txidx) {
-		/* read residual data from RX fifo */
+	for (timeout = RK_SPI_XFER_TIMEOUT_US;
+	    err == 0 && sc->rxidx != sc->rxlen && timeout > 0;
+	    timeout--) {
 		rk_spi_empty_rxfifo(sc);
+		if (sc->rxidx != sc->rxlen)
+			DELAY(1);
 	}
 
-	if (sc->rxidx != sc->rxlen || sc->txidx != sc->txlen)
+	if (err == 0 && sc->rxidx != sc->rxlen)
+		err = ETIMEDOUT;
+	if (err == 0 && sc->txidx != sc->txlen)
 		err = EIO;
+	for (timeout = RK_SPI_XFER_TIMEOUT_US;
+	    err == 0 && (RK_SPI_READ_4(sc, RK_SPI_SR) & SR_BUSY) != 0 &&
+	    timeout > 0; timeout--)
+		DELAY(1);
+	if (err == 0 && (RK_SPI_READ_4(sc, RK_SPI_SR) & SR_BUSY) != 0)
+		err = ETIMEDOUT;
+
+	RK_SPI_WRITE_4(sc, RK_SPI_IMR, 0);
+	RK_SPI_WRITE_4(sc, RK_SPI_ICR, UINT32_MAX);
+	rk_spi_enable_chip(sc, 0);
 
 	return (err);
 }
@@ -327,6 +372,9 @@ rk_spi_attach(device_t dev)
 	}
 	clk_get_freq(sc->clk_spi, &sc->max_freq);
 
+	rk_spi_enable_chip(sc, 0);
+	RK_SPI_WRITE_4(sc, RK_SPI_IMR, 0);
+	RK_SPI_WRITE_4(sc, RK_SPI_ICR, UINT32_MAX);
 	sc->fifo_size = rk_spi_fifo_size(sc);
 	if (sc->fifo_size == 0) {
 		device_printf(dev, "failed to get fifo size\n");
@@ -425,8 +473,8 @@ rk_spi_transfer(device_t dev, device_t child, struct spi_command *cmd)
 	spibus_get_mode(child, &mode);
 
 	RK_SPI_LOCK(sc);
+	rk_spi_enable_chip(sc, 0);
 	rk_spi_hw_setup(sc, mode, clock);
-	rk_spi_enable_chip(sc, 1);
 	err = rk_spi_set_cs(sc, cs, true);
 	if (err != 0) {
 		rk_spi_enable_chip(sc, 0);

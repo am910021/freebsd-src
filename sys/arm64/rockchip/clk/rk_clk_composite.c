@@ -180,7 +180,11 @@ rk_clk_composite_recalc(struct clknode *clk, uint64_t *freq)
 	DEVICE_UNLOCK(clk);
 
 	div = ((reg & sc->div_mask) >> sc->div_shift);
-	if (sc->flags & RK_CLK_COMPOSITE_DIV_EXP)
+	if (sc->flags & RK_CLK_COMPOSITE_DIV_HALF) {
+		div = div * 2 + 3;
+		*freq = (*freq * 2 + div - 1) / div;
+		return (0);
+	} else if (sc->flags & RK_CLK_COMPOSITE_DIV_EXP)
 		div = 1 << div;
 	else
 		div += 1;
@@ -232,6 +236,10 @@ rk_clk_composite_set_freq(struct clknode *clk, uint64_t fparent, uint64_t *fout,
 	int p_idx, best_parent;
 
 	sc = clknode_get_softc(clk);
+	if (sc->flags & RK_CLK_COMPOSITE_DIV_HALF) {
+		*stop = 1;
+		return (EOPNOTSUPP);
+	}
 	dprintf("Finding best parent/div for target freq of %ju\n", *fout);
 	p_names = clknode_get_parent_names(clk);
 	for (best_div = 0, best = 0, p_idx = 0;

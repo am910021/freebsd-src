@@ -101,6 +101,8 @@
 #include <dev/ofw/openfirm.h>
 #endif
 
+#include <arm64/arm64/machdep_soc.h>
+
 #include <dev/smbios/smbios.h>
 
 _Static_assert(sizeof(struct pcb) == 1248, "struct pcb is incorrect size");
@@ -865,6 +867,9 @@ memory_mapping_mode(vm_paddr_t pa)
 		break;
 	}
 
+	if (arm64_machdep_soc_memory_contains(pa))
+		return (VM_MEMATTR_WRITE_BACK);
+
 	return (VM_MEMATTR_DEVICE);
 }
 
@@ -912,8 +917,10 @@ initarm(struct arm64_bootparams *abp)
 	/* Load the physical memory ranges */
 	efihdr = (struct efi_map_header *)preload_search_info(kmdp,
 	    MODINFO_METADATA | MODINFOMD_EFI_MAP);
-	if (efihdr != NULL)
+	if (efihdr != NULL) {
 		add_efi_map_entries(efihdr);
+		arm64_machdep_soc_efi_map_fixup(efihdr);
+	}
 #ifdef FDT
 	else {
 		/* Grab physical memory regions information from device tree. */

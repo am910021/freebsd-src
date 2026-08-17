@@ -31,6 +31,9 @@
 #ifndef DEV_MMC_HOST_DWMMC_VAR_H
 #define DEV_MMC_HOST_DWMMC_VAR_H
 
+#include <sys/callout.h>
+#include <sys/eventhandler.h>
+
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/hwreset/hwreset.h>
 #include <dev/extres/regulator/regulator.h>
@@ -54,6 +57,7 @@ struct dwmmc_softc {
 	struct mmc_host		host;
 	struct mmc_helper	mmc_helper;
 	struct mtx		sc_mtx;
+	struct callout		cmd11_callout;
 #ifdef MMCCAM
 	union ccb *		ccb;
 	struct mmc_sim		mmc_sim;
@@ -65,11 +69,18 @@ struct dwmmc_softc {
 	uint32_t		hwtype;
 	uint32_t		use_auto_stop;
 	uint32_t		use_pio;
+	bool			voltage_switch;
+	bool			need_power_on_reset;
+	bool			safe_power_cycle;
+	eventhandler_tag	shutdown_eh;
+	uint32_t		power_off_delay_ms;
 	device_t		child;
 	struct task		card_task;	/* Card presence check task */
 	struct timeout_task	card_delayed_task;/* Card insert delayed task */
 
 	int			(*update_ios)(struct dwmmc_softc *sc, struct mmc_ios *ios);
+	int			(*tune)(struct dwmmc_softc *sc, device_t reqdev,
+				    bool hs400);
 
 	bus_dma_tag_t		desc_tag;
 	bus_dmamap_t		desc_map;
@@ -99,5 +110,6 @@ DECLARE_CLASS(dwmmc_driver);
 
 int dwmmc_attach(device_t);
 int dwmmc_detach(device_t);
+int dwmmc_prepare_reboot(device_t);
 
 #endif

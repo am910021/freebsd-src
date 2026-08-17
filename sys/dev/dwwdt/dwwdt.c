@@ -74,6 +74,7 @@ struct dwwdt_softc {
 	struct resource		*sc_irq_res;
 	void			*sc_intr_cookie;
 	clk_t			 sc_clk;
+	clk_t			 sc_pclk;
 	uint64_t		 sc_clk_freq;
 	eventhandler_tag	 sc_evtag;
 	int 			 sc_mem_rid;
@@ -242,9 +243,13 @@ static int
 dwwdt_attach(device_t dev)
 {
 	struct dwwdt_softc *sc;
+	phandle_t node;
+	int error;
+	int pclk_idx;
 
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
+	node = ofw_bus_get_node(dev);
 
 	sc->sc_mem_rid = 0;
 	sc->sc_mem_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
@@ -269,30 +274,50 @@ dwwdt_attach(device_t dev)
 		goto err_no_intr;
 	}
 
-	if (clk_get_by_ofw_index(dev, 0, 0, &sc->sc_clk) != 0) {
+	if (clk_get_by_ofw_name(dev, node, "tclk", &sc->sc_clk) != 0 &&
+	    clk_get_by_ofw_index(dev, node, 0, &sc->sc_clk) != 0) {
 		device_printf(dev, "cannot find clock\n");
 		goto err_no_clock;
 	}
 
 	if (clk_enable(sc->sc_clk) != 0) {
 		device_printf(dev, "cannot enable clock\n");
-		goto err_no_freq;
+		goto err_release_clock;
 	}
 
 	if (clk_get_freq(sc->sc_clk, &sc->sc_clk_freq) != 0) {
 		device_printf(dev, "cannot get clock frequency\n");
-		goto err_no_freq;
+		goto err_disable_clock;
 	}
 
 	if (sc->sc_clk_freq == 0UL)
-		goto err_no_freq;
+		goto err_disable_clock;
+
+	/* The APB clock is optional for synchronous DW watchdog instances. */
+	if (ofw_bus_find_string_index(node, "clock-names", "pclk",
+	    &pclk_idx) == 0) {
+		error = clk_get_by_ofw_index(dev, node, pclk_idx,
+		    &sc->sc_pclk);
+		if (error != 0) {
+			device_printf(dev, "cannot find pclk\n");
+			goto err_disable_clock;
+		}
+		if (clk_enable(sc->sc_pclk) != 0) {
+			device_printf(dev, "cannot enable pclk\n");
+			goto err_release_pclk;
+		}
+	}
 
 	sc->sc_evtag = EVENTHANDLER_REGISTER(watchdog_list, dwwdt_event, sc, 0);
 	sc->sc_status = DWWDT_STOPPED;
 
 	return (bus_generic_attach(dev));
 
-err_no_freq:
+err_release_pclk:
+	clk_release(sc->sc_pclk);
+err_disable_clock:
+	clk_disable(sc->sc_clk);
+err_release_clock:
 	clk_release(sc->sc_clk);
 err_no_clock:
 	bus_teardown_intr(dev, sc->sc_irq_res, sc->sc_intr_cookie);
@@ -326,8 +351,15 @@ dwwdt_detach(device_t dev)
 	EVENTHANDLER_DEREGISTER(watchdog_list, sc->sc_evtag);
 	sc->sc_evtag = NULL;
 
-	if (sc->sc_clk != NULL)
+	if (sc->sc_pclk != NULL) {
+		clk_disable(sc->sc_pclk);
+		clk_release(sc->sc_pclk);
+	}
+
+	if (sc->sc_clk != NULL) {
+		clk_disable(sc->sc_clk);
 		clk_release(sc->sc_clk);
+	}
 
 	if (sc->sc_intr_cookie != NULL)
 		bus_teardown_intr(dev, sc->sc_irq_res, sc->sc_intr_cookie);

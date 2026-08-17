@@ -209,7 +209,7 @@ cpufreq_attach(device_t dev)
 }
 
 /* Handle any work to be done for all drivers that attached during boot. */
-static void 
+static void
 cpufreq_startup_task(void *ctx, int pending)
 {
 
@@ -269,7 +269,7 @@ cf_set_method(device_t dev, const struct cf_level *level, int priority)
 	 * changing the frequency until they're online.  This is because we
 	 * can't switch to them using sched_bind() and thus we'd only be
 	 * switching the main CPU.  XXXTODO: Need to think more about how to
-	 * handle having different CPUs at different frequencies.  
+	 * handle having different CPUs at different frequencies.
 	 */
 	if (mp_ncpus > 1 && !smp_started) {
 		device_printf(dev, "rejecting change, SMP not started yet\n");
@@ -944,10 +944,13 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	struct cpufreq_softc *sc;
 	struct cf_level *levels;
-	int best, count, diff, bdiff, devcount, error, freq, i, n;
+	device_t domain_dev;
+	int best, count, diff, bdiff, devcount, error, free_devs, freq, i, n;
+	int type;
 	device_t *devs;
 
 	devs = NULL;
+	free_devs = 0;
 	sc = oidp->oid_arg1;
 	levels = sc->levels_buf;
 
@@ -959,14 +962,24 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 	if (error != 0 || req->newptr == NULL)
 		goto out;
 
-	/*
-	 * While we only call cpufreq_get() on one device (assuming all
-	 * CPUs have equal levels), we call cpufreq_set() on all CPUs.
-	 * This is needed for some MP systems.
-	 */
-	error = devclass_get_devices(devclass_find("cpufreq"), &devs, &devcount);
-	if (error)
+	error = CPUFREQ_DRV_TYPE(sc->cf_drv_dev, &type);
+	if (error != 0)
 		goto out;
+	if ((type & CPUFREQ_FLAG_PER_DOMAIN) != 0) {
+		domain_dev = sc->dev;
+		devs = &domain_dev;
+		devcount = 1;
+	} else {
+		/*
+		 * Legacy drivers expect one request to be mirrored to all
+		 * CPUs in the system.
+		 */
+		error = devclass_get_devices(devclass_find("cpufreq"), &devs,
+		    &devcount);
+		if (error != 0)
+			goto out;
+		free_devs = 1;
+	}
 	for (n = 0; n < devcount; n++) {
 		count = CF_MAX_LEVELS;
 		error = CPUFREQ_LEVELS(devs[n], levels, &count);
@@ -989,7 +1002,7 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 	}
 
 out:
-	if (devs)
+	if (free_devs)
 		free(devs, M_TEMP);
 	return (error);
 }
@@ -1098,8 +1111,8 @@ cpufreq_register(device_t dev)
 	    cpufreq_settings_sysctl, "A", "CPU frequency driver settings");
 
 	/*
-	 * Add only one cpufreq device to each CPU.  Currently, all CPUs
-	 * must offer the same levels and be switched at the same time.
+	 * Add only one cpufreq device to each CPU.  Drivers without
+	 * CPUFREQ_FLAG_PER_DOMAIN retain the legacy system-wide switching.
 	 */
 	cpu_dev = device_get_parent(dev);
 	if ((cf_dev = device_find_child(cpu_dev, "cpufreq", -1))) {

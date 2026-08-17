@@ -773,3 +773,99 @@ rk3399_clk_pll_register(struct clkdom *clkdom, struct rk_clk_pll_def *clkdef)
 
 	return (0);
 }
+
+#define	RK3588_CLK_PLL_M_MASK		0x3ff
+#define	RK3588_CLK_PLL_P_MASK		0x3f
+#define	RK3588_CLK_PLL_S_SHIFT		6
+#define	RK3588_CLK_PLL_S_MASK		0x7
+#define	RK3588_CLK_PLL_K_MASK		0xffff
+#define	RK3588_CLK_PLL_MODE_MASK	0x3
+#define	RK3588_CLK_PLL_MODE_SLOW	0
+#define	RK3588_CLK_PLL_MODE_NORMAL	1
+#define	RK3588_CLK_PLL_MODE_DEEP	2
+
+static int
+rk3588_clk_pll_init(struct clknode *clk, device_t dev)
+{
+	clknode_init_parent_idx(clk, 0);
+
+	return (0);
+}
+
+static int
+rk3588_clk_pll_recalc(struct clknode *clk, uint64_t *freq)
+{
+	struct rk_clk_pll_sc *sc;
+	uint64_t divisor, rate, scaled;
+	uint32_t con0, con1, con2, mode;
+	uint32_t k, m, p, s;
+
+	sc = clknode_get_softc(clk);
+
+	DEVICE_LOCK(clk);
+	READ4(clk, sc->base_offset, &con0);
+	READ4(clk, sc->base_offset + 4, &con1);
+	READ4(clk, sc->base_offset + 8, &con2);
+	READ4(clk, sc->mode_reg, &mode);
+	DEVICE_UNLOCK(clk);
+
+	mode = (mode >> sc->mode_shift) & RK3588_CLK_PLL_MODE_MASK;
+	if (mode == RK3588_CLK_PLL_MODE_SLOW)
+		return (0);
+	if (mode == RK3588_CLK_PLL_MODE_DEEP) {
+		*freq = 32768;
+		return (0);
+	}
+	if (mode != RK3588_CLK_PLL_MODE_NORMAL)
+		return (EINVAL);
+
+	m = con0 & RK3588_CLK_PLL_M_MASK;
+	p = con1 & RK3588_CLK_PLL_P_MASK;
+	s = (con1 >> RK3588_CLK_PLL_S_SHIFT) & RK3588_CLK_PLL_S_MASK;
+	k = con2 & RK3588_CLK_PLL_K_MASK;
+	if (p == 0)
+		return (EINVAL);
+
+	scaled = (uint64_t)m << 16;
+	if ((k & (1U << 15)) != 0)
+		scaled -= ((~k + 1) & RK3588_CLK_PLL_K_MASK);
+	else
+		scaled += k;
+
+	divisor = ((uint64_t)p << s) << 16;
+	rate = *freq * scaled;
+	*freq = rate / divisor;
+
+	return (0);
+}
+
+static clknode_method_t rk3588_clk_pll_clknode_methods[] = {
+	CLKNODEMETHOD(clknode_init,		rk3588_clk_pll_init),
+	CLKNODEMETHOD(clknode_recalc_freq,	rk3588_clk_pll_recalc),
+	CLKNODEMETHOD_END
+};
+
+DEFINE_CLASS_1(rk3588_clk_pll_clknode, rk3588_clk_pll_clknode_class,
+    rk3588_clk_pll_clknode_methods, sizeof(struct rk_clk_pll_sc),
+    clknode_class);
+
+int
+rk3588_clk_pll_register(struct clkdom *clkdom, struct rk_clk_pll_def *clkdef)
+{
+	struct clknode *clk;
+	struct rk_clk_pll_sc *sc;
+
+	clk = clknode_create(clkdom, &rk3588_clk_pll_clknode_class,
+	    &clkdef->clkdef);
+	if (clk == NULL)
+		return (1);
+
+	sc = clknode_get_softc(clk);
+	sc->base_offset = clkdef->base_offset;
+	sc->mode_reg = clkdef->mode_reg;
+	sc->mode_shift = clkdef->mode_shift;
+
+	clknode_register(clkdom, clk);
+
+	return (0);
+}

@@ -90,11 +90,16 @@ struct iommu_unit {
 	uint32_t buswide_ctxs[(PCI_BUSMAX + 1) / NBBY / sizeof(uint32_t)];
 };
 
+#define	IOMMU_IOVA_CACHE_BUCKETS	17
+
 struct iommu_domain_map_ops {
 	int (*map)(struct iommu_domain *domain, struct iommu_map_entry *entry,
 	    vm_page_t *ma, uint64_t pflags, int flags);
 	int (*unmap)(struct iommu_domain *domain, struct iommu_map_entry *entry,
 	    int flags);
+	int (*unmap_nosync)(struct iommu_domain *domain,
+	    struct iommu_map_entry *entry, int flags);
+	void (*sync)(struct iommu_domain *domain);
 };
 
 /*
@@ -112,6 +117,10 @@ struct iommu_domain {
 	u_int entries_cnt;		/* (d) */
 	struct iommu_map_entries_tailq unload_entries; /* (d) Entries to
 							 unload */
+	struct iommu_map_entries_tailq iova_cache
+	    [IOMMU_IOVA_CACHE_BUCKETS]; /* (d) Unmapped retained IOVA */
+	struct iommu_map_entries_tailq iova_pending
+	    [IOMMU_IOVA_CACHE_BUCKETS]; /* (d) Awaiting IOTLB sync */
 	struct iommu_gas_entries_tree rb_root; /* (d) */
 	struct iommu_map_entry *start_gap;     /* (d) */
 	iommu_gaddr_t end;		/* (c) Highest address + 1 in
@@ -120,6 +129,8 @@ struct iommu_domain {
 	struct iommu_map_entry *msi_entry; /* (d) Arch-specific */
 	iommu_gaddr_t msi_base;		/* (d) Arch-specific */
 	vm_paddr_t msi_phys;		/* (d) Arch-specific */
+	u_int iova_cache_count; /* (d) */
+	u_int iova_pending_count; /* (d) */
 	u_int flags;			/* (u) */
 	LIST_HEAD(, iommu_ctx) contexts;/* (u) */
 };

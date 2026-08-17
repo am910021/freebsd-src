@@ -195,6 +195,7 @@ smmu_acpi_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	sc->dma_memattr_policy = SMMU_DMA_MEMATTR_GENERIC;
 
 	priv = (uintptr_t)acpi_get_private(dev);
 	if ((priv >> 32) & ACPI_IORT_SMMU_V3_COHACC_OVERRIDE)

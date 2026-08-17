@@ -33,6 +33,7 @@
 #include <machine/vmparam.h>
 
 #include "assym.inc"
+#include "opt_copyio.h"
 
 .macro check_user_access user_arg, size_arg, bad_access_func
 	adds	x6, x\user_arg, x\size_arg
@@ -151,6 +152,15 @@ copycommon:
 	ands	x3, x3, 0x07
 	b.eq	aligned
 
+#if defined(ARM64_COPYIO_ALIGNED_WORD_PAIR)
+	/*
+	 * Opt-in performance path for kernels whose copyin/copyout endpoints
+	 * are Normal memory.  Less aligned copies retain the byte-safe path.
+	 */
+	ands	x3, x3, 0x03
+	b.eq	word_aligned
+#endif
+
 	/* Unaligned is byte by byte copy */
 byte_by_byte:
 	ldrb	w3, [x0], #0x01
@@ -190,6 +200,49 @@ by_dwords:
 	stp	x3, x4, [x1], #0x10
 	subs	x15, x15, #0x01
 	b.ne  	by_dwords
+
+#if defined(ARM64_COPYIO_ALIGNED_WORD_PAIR)
+	b	lead_out
+
+word_aligned:
+	cmp	x2, #0x40
+	b.lt	by_word_pairs_start
+
+	/* Copy 64-byte blocks with naturally aligned 32-bit pair accesses. */
+	lsr	x15, x2, #0x06
+by_word_blocks:
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+
+	subs	x15, x15, #0x01
+	b.ne	by_word_blocks
+
+	and	x2, x2, #0x3f
+
+by_word_pairs_start:
+	lsr	x15, x2, #0x03
+	cbz	x15, last_word
+by_word_pairs:
+	ldp	w3, w4, [x0], #0x08
+	stp	w3, w4, [x1], #0x08
+	subs	x15, x15, #0x01
+	b.ne	by_word_pairs
+	b	last_word
+#endif
 
 	/* Less than 16 bytes to copy */
 lead_out:

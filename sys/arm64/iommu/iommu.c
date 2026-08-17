@@ -94,6 +94,28 @@ iommu_domain_unmap_buf(struct iommu_domain *iodom,
 }
 
 static int
+iommu_domain_unmap_buf_nosync(struct iommu_domain *iodom,
+    struct iommu_map_entry *entry, int flags)
+{
+	struct iommu_unit *iommu;
+	int error;
+
+	iommu = iodom->iommu;
+	error = IOMMU_UNMAP_NOSYNC(iommu->dev, iodom, entry->start,
+	    entry->end - entry->start);
+	return (error);
+}
+
+static void
+iommu_domain_sync_buf(struct iommu_domain *iodom)
+{
+	struct iommu_unit *iommu;
+
+	iommu = iodom->iommu;
+	IOMMU_DOMAIN_SYNC(iommu->dev, iodom);
+}
+
+static int
 iommu_domain_map_buf(struct iommu_domain *iodom, struct iommu_map_entry *entry,
     vm_page_t *ma, uint64_t eflags, int flags)
 {
@@ -120,6 +142,8 @@ iommu_domain_map_buf(struct iommu_domain *iodom, struct iommu_map_entry *entry,
 static const struct iommu_domain_map_ops domain_map_ops = {
 	.map = iommu_domain_map_buf,
 	.unmap = iommu_domain_unmap_buf,
+	.unmap_nosync = iommu_domain_unmap_buf_nosync,
+	.sync = iommu_domain_sync_buf,
 };
 
 static struct iommu_domain *
@@ -212,6 +236,7 @@ iommu_ctx_init(device_t requester, struct iommu_ctx *ioctx)
 	error = IOMMU_CTX_INIT(iommu->dev, ioctx);
 	if (error)
 		return (error);
+	ioctx->refs = 1;
 
 	tag = ioctx->tag = malloc(sizeof(struct bus_dma_tag_iommu),
 	    M_IOMMU, M_WAITOK | M_ZERO);
@@ -342,6 +367,9 @@ iommu_get_ctx(struct iommu_unit *iommu, device_t requester,
 	IOMMU_LOCK(iommu);
 	ioctx = IOMMU_CTX_LOOKUP(iommu->dev, requester);
 	if (ioctx) {
+		KASSERT(ioctx->refs >= 1, ("iommu ctx %p refs %u", ioctx,
+		    ioctx->refs));
+		ioctx->refs++;
 		IOMMU_UNLOCK(iommu);
 		return (ioctx);
 	}
@@ -378,6 +406,15 @@ iommu_free_ctx_locked(struct iommu_unit *iommu, struct iommu_ctx *ioctx)
 	int error;
 
 	IOMMU_ASSERT_LOCKED(iommu);
+	KASSERT(ioctx->refs >= 1, ("iommu ctx %p refs %u", ioctx,
+	    ioctx->refs));
+	if (ioctx->refs > 1) {
+		ioctx->refs--;
+		IOMMU_UNLOCK(iommu);
+		return;
+	}
+	KASSERT((ioctx->flags & IOMMU_CTX_DISABLED) == 0,
+	    ("lost ref on disabled ctx %p", ioctx));
 
 	tag = ioctx->tag;
 

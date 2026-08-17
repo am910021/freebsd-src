@@ -32,10 +32,12 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/rman.h>
+#include <sys/sysctl.h>
 #include <machine/bus.h>
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#include <dev/fdt/fdt_pinctrl.h>
 
 #include <dev/iicbus/iiconf.h>
 #include <dev/iicbus/iicbus.h>
@@ -57,6 +59,10 @@
 #define	 RK_I2C_CON_LASTACK		(1 << 5)
 #define	 RK_I2C_CON_NAKSTOP		(1 << 6)
 #define	 RK_I2C_CON_CTRL_MASK		0xFF
+#define	 RK_I2C_CON_TUNING_MASK		0xFF00
+#define	 RK_I2C_CON_SDA_CFG(x)		((x) << 8)
+#define	 RK_I2C_CON_STA_CFG(x)		((x) << 12)
+#define	 RK_I2C_CON_STO_CFG(x)		((x) << 14)
 
 #define	RK_I2C_CLKDIV		0x04
 #define	 RK_I2C_CLKDIVL_MASK	0xFFFF
@@ -110,6 +116,9 @@
 
 /* 8 data registers, 4 bytes each. */
 #define	RK_I2C_MAX_RXTX_LEN	32
+#define	RK_I2C_DIAG_VERSION	"Rockchip I2C"
+#define	RK_I2C_DIAG_LIMIT	96
+#define	RK_I2C_DEFAULT_BUS_FREQ	100000
 
 enum rk_i2c_state {
 	STATE_IDLE = 0,
@@ -117,6 +126,10 @@ enum rk_i2c_state {
 	STATE_READ,
 	STATE_WRITE,
 	STATE_STOP
+};
+
+struct rk_i2c_config {
+	bool		has_con_tuning;
 };
 
 struct rk_i2c_softc {
@@ -136,14 +149,34 @@ struct rk_i2c_softc {
 	bool		tx_slave_addr;
 	uint8_t		mode;
 	uint8_t		state;
+	uint32_t	diag_count;
+	uint32_t	xfer_id;
+	uint32_t	tuning;
+	const struct rk_i2c_config *config;
 
 	device_t	iicbus;
 };
 
+static int rk_i2c_diag_enable = 0;
+SYSCTL_INT(_hw, OID_AUTO, rk_i2c_diag, CTLFLAG_RWTUN,
+    &rk_i2c_diag_enable, 0, "Enable Rockchip I2C diagnostics");
+static int rk_i2c_poll_enable = 0;
+SYSCTL_INT(_hw, OID_AUTO, rk_i2c_poll, CTLFLAG_RWTUN,
+    &rk_i2c_poll_enable, 0, "Poll Rockchip I2C interrupt status");
+
+static const struct rk_i2c_config rk_i2c_config_default = {
+	.has_con_tuning = false,
+};
+
+static const struct rk_i2c_config rk_i2c_config_rk3588 = {
+	.has_con_tuning = true,
+};
+
 static struct ofw_compat_data compat_data[] = {
-	{"rockchip,rk3288-i2c", 1},
-	{"rockchip,rk3328-i2c", 1},
-	{"rockchip,rk3399-i2c", 1},
+	{"rockchip,rk3588-i2c", (uintptr_t)&rk_i2c_config_rk3588},
+	{"rockchip,rk3288-i2c", (uintptr_t)&rk_i2c_config_default},
+	{"rockchip,rk3328-i2c", (uintptr_t)&rk_i2c_config_default},
+	{"rockchip,rk3399-i2c", (uintptr_t)&rk_i2c_config_default},
 	{NULL,             0}
 };
 
@@ -163,23 +196,60 @@ static int rk_i2c_detach(device_t dev);
 #define	RK_I2C_READ(sc, reg)		bus_read_4((sc)->res[0], (reg))
 #define	RK_I2C_WRITE(sc, reg, val)	bus_write_4((sc)->res[0], (reg), (val))
 
-static uint32_t
-rk_i2c_get_clkdiv(struct rk_i2c_softc *sc, uint32_t speed)
+static bool
+rk_i2c_has_con_tuning(struct rk_i2c_softc *sc)
+{
+
+	return (sc->config != NULL && sc->config->has_con_tuning);
+}
+
+static void
+rk_i2c_diag(struct rk_i2c_softc *sc, const char *tag)
+{
+
+	if (rk_i2c_diag_enable == 0 || sc->diag_count >= RK_I2C_DIAG_LIMIT)
+		return;
+
+	sc->diag_count++;
+	device_printf(sc->dev,
+	    "%s %s xfer=%u state=%u mode=%u cnt=%zu done=%d nak=%d "
+	    "con=0x%08x clkdiv=0x%08x ien=0x%08x ipd=0x%08x "
+	    "mtxcnt=0x%08x mrxcnt=0x%08x\n",
+	    RK_I2C_DIAG_VERSION, tag, sc->xfer_id, sc->state, sc->mode,
+	    sc->cnt, sc->transfer_done, sc->nak_recv,
+	    RK_I2C_READ(sc, RK_I2C_CON), RK_I2C_READ(sc, RK_I2C_CLKDIV),
+	    RK_I2C_READ(sc, RK_I2C_IEN), RK_I2C_READ(sc, RK_I2C_IPD),
+	    RK_I2C_READ(sc, RK_I2C_MTXCNT),
+	    RK_I2C_READ(sc, RK_I2C_MRXCNT));
+}
+
+static int
+rk_i2c_calc_timing(struct rk_i2c_softc *sc, uint32_t speed, uint32_t *clkdiv,
+    uint32_t *tuning)
 {
 	uint64_t sclk_freq;
-	uint32_t clkdiv;
+	uint32_t div;
 	int err;
 
 	err = clk_get_freq(sc->sclk, &sclk_freq);
 	if (err != 0)
 		return (err);
 
-	clkdiv = (sclk_freq / speed / RK_I2C_CLKDIV_MUL / 2) - 1;
-	clkdiv &= RK_I2C_CLKDIVL_MASK;
+	div = (sclk_freq / speed / RK_I2C_CLKDIV_MUL / 2) - 1;
+	div &= RK_I2C_CLKDIVL_MASK;
+	*clkdiv = div << RK_I2C_CLKDIVH_SHIFT | div;
+	*tuning = 0;
 
-	clkdiv = clkdiv << RK_I2C_CLKDIVH_SHIFT | clkdiv;
+	/*
+	 * Some Rockchip controllers expose timing fields in CON[15:8].
+	 * Linux computes these from the bus timing; for 100 kHz on a 100 MHz
+	 * input this lands on SDA update config 2 and start/stop config 0.
+	 */
+	if (rk_i2c_has_con_tuning(sc))
+		*tuning = RK_I2C_CON_SDA_CFG(2) | RK_I2C_CON_STA_CFG(0) |
+		    RK_I2C_CON_STO_CFG(0);
 
-	return (clkdiv);
+	return (0);
 }
 
 static int
@@ -188,12 +258,15 @@ rk_i2c_reset(device_t dev, u_char speed, u_char addr, u_char *oldaddr)
 	struct rk_i2c_softc *sc;
 	uint32_t clkdiv;
 	u_int busfreq;
+	int err;
 
 	sc = device_get_softc(dev);
 
 	busfreq = IICBUS_GET_FREQUENCY(sc->iicbus, speed);
 
-	clkdiv = rk_i2c_get_clkdiv(sc, busfreq);
+	err = rk_i2c_calc_timing(sc, busfreq, &clkdiv, &sc->tuning);
+	if (err != 0)
+		return (err);
 
 	RK_I2C_LOCK(sc);
 
@@ -204,6 +277,11 @@ rk_i2c_reset(device_t dev, u_char speed, u_char addr, u_char *oldaddr)
 	RK_I2C_WRITE(sc, RK_I2C_CON, 0);
 
 	RK_I2C_UNLOCK(sc);
+
+	if (rk_i2c_diag_enable != 0)
+		device_printf(sc->dev,
+		    "%s reset speed=%u busfreq=%u clkdiv=0x%08x tuning=0x%08x\n",
+		    RK_I2C_DIAG_VERSION, speed, busfreq, clkdiv, sc->tuning);
 
 	return (0);
 }
@@ -289,6 +367,7 @@ rk_i2c_send_stop(struct rk_i2c_softc *sc)
 	reg = RK_I2C_READ(sc, RK_I2C_CON);
 	reg |= RK_I2C_CON_STOP;
 	RK_I2C_WRITE(sc, RK_I2C_CON, reg);
+	rk_i2c_diag(sc, "send-stop");
 }
 
 static void
@@ -303,6 +382,8 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 	if ((sc->ipd & RK_I2C_IPD_ALL) == 0)
 		return;
 
+	rk_i2c_diag(sc, "intr-enter");
+
 	RK_I2C_WRITE(sc, RK_I2C_IPD, sc->ipd);
 	sc->ipd &= RK_I2C_IPD_ALL;
 
@@ -313,11 +394,13 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 		/* XXXX last byte !!!, signal error !!! */
 		sc->transfer_done = true;
 		sc->state = STATE_IDLE;
+		rk_i2c_diag(sc, "intr-nak");
 		goto err;
 	}
 
 	switch (sc->state) {
 	case STATE_START:
+		rk_i2c_diag(sc, "state-start");
 		/* Disable start bit */
 		reg = RK_I2C_READ(sc, RK_I2C_CON);
 		reg &= ~RK_I2C_CON_START;
@@ -349,6 +432,7 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 		}
 		break;
 	case STATE_READ:
+		rk_i2c_diag(sc, "state-read");
 		rk_i2c_drain_rx(sc);
 
 		if (sc->cnt == sc->msg->len)
@@ -373,6 +457,7 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 
 		break;
 	case STATE_WRITE:
+		rk_i2c_diag(sc, "state-write");
 		if (sc->cnt < sc->msg->len) {
 			/* Keep writing. */
 			RK_I2C_WRITE(sc, RK_I2C_IEN, RK_I2C_IEN_MBTFIEN |
@@ -386,6 +471,7 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 		}
 		/* passthru */
 	case STATE_STOP:
+		rk_i2c_diag(sc, "state-stop");
 		/* Disable stop bit */
 		reg = RK_I2C_READ(sc, RK_I2C_CON);
 		reg &= ~RK_I2C_CON_STOP;
@@ -393,6 +479,7 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 
 		sc->transfer_done = 1;
 		sc->state = STATE_IDLE;
+		rk_i2c_diag(sc, "done");
 		break;
 	case STATE_IDLE:
 		break;
@@ -400,6 +487,34 @@ rk_i2c_intr_locked(struct rk_i2c_softc *sc)
 
 err:
 	wakeup(sc);
+}
+
+static void
+rk_i2c_timeout_recover(struct rk_i2c_softc *sc)
+{
+	uint32_t reg;
+	int timeout;
+
+	rk_i2c_diag(sc, "timeout-before-stop");
+
+	RK_I2C_WRITE(sc, RK_I2C_IEN, 0);
+	reg = RK_I2C_READ(sc, RK_I2C_CON);
+	reg &= ~RK_I2C_CON_CTRL_MASK;
+	if (rk_i2c_has_con_tuning(sc)) {
+		reg &= ~RK_I2C_CON_TUNING_MASK;
+		reg |= sc->tuning;
+	}
+	reg |= RK_I2C_CON_EN | RK_I2C_CON_STOP;
+	RK_I2C_WRITE(sc, RK_I2C_CON, reg);
+
+	for (timeout = 1000; timeout > 0; timeout--) {
+		if ((RK_I2C_READ(sc, RK_I2C_IPD) & RK_I2C_IPD_STOPIPD) != 0)
+			break;
+		DELAY(10);
+	}
+	rk_i2c_diag(sc, "timeout-after-stop");
+	RK_I2C_WRITE(sc, RK_I2C_IPD, RK_I2C_IPD_ALL);
+	sc->state = STATE_IDLE;
 }
 
 static void
@@ -428,6 +543,10 @@ rk_i2c_start_xfer(struct rk_i2c_softc *sc, struct iic_msg *msg, boolean_t last)
 	sc->msg = msg;
 
 	reg = RK_I2C_READ(sc, RK_I2C_CON) & ~RK_I2C_CON_CTRL_MASK;
+	if (rk_i2c_has_con_tuning(sc)) {
+		reg &= ~RK_I2C_CON_TUNING_MASK;
+		reg |= sc->tuning;
+	}
 	if (!(sc->msg->flags & IIC_M_NOSTART)) {
 		/* Stadard message */
 		if (sc->mode == RK_I2C_CON_MODE_TX) {
@@ -461,6 +580,7 @@ rk_i2c_start_xfer(struct rk_i2c_softc *sc, struct iic_msg *msg, boolean_t last)
 	reg |= sc->mode << RK_I2C_CON_MODE_SHIFT;
 	reg |= RK_I2C_CON_EN;
 	RK_I2C_WRITE(sc, RK_I2C_CON, reg);
+	rk_i2c_diag(sc, "start-xfer");
 }
 
 static int
@@ -478,6 +598,11 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 	while (sc->busy)
 		mtx_sleep(sc, &sc->mtx, 0, "i2cbuswait", 0);
 	sc->busy = 1;
+	sc->xfer_id++;
+
+	if (rk_i2c_diag_enable != 0)
+		device_printf(dev, "%s transfer begin xfer=%u nmsgs=%u\n",
+		    RK_I2C_DIAG_VERSION, sc->xfer_id, nmsgs);
 
 	/* Disable the module and interrupts */
 	RK_I2C_WRITE(sc, RK_I2C_CON, 0);
@@ -494,6 +619,11 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 			err = IIC_ENOTSUPP;
 			break;
 		}
+		if (rk_i2c_diag_enable != 0 && sc->diag_count < RK_I2C_DIAG_LIMIT)
+			device_printf(dev,
+			    "%s msg xfer=%u idx=%d slave=0x%02x flags=0x%04x len=%u\n",
+			    RK_I2C_DIAG_VERSION, sc->xfer_id, i,
+			    msgs[i].slave, msgs[i].flags, msgs[i].len);
 		/*
 		 * If next message have NOSTART flag, then they both
 		 * should be same type (read/write) and same address.
@@ -554,20 +684,32 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 		    !(msgs[i + 1].flags & IIC_M_NOSTART);
 		rk_i2c_start_xfer(sc, msgs + i, last_msg);
 
-		if (cold) {
+		if (cold || rk_i2c_poll_enable != 0) {
 			for(timeout = 10000; timeout > 0; timeout--)  {
 				rk_i2c_intr_locked(sc);
 				if (sc->transfer_done)
 					break;
 				DELAY(1000);
 			}
-			if (timeout <= 0)
+			if (timeout <= 0) {
+				rk_i2c_timeout_recover(sc);
 				err = IIC_ETIMEOUT;
+			} else if (rk_i2c_poll_enable != 0)
+				rk_i2c_diag(sc, "poll-complete");
 		} else {
 			while (err == 0 && !sc->transfer_done) {
 				err = msleep(sc, &sc->mtx, PZERO, "rk_i2c",
 				    10 * hz);
+				if (err != 0)
+					rk_i2c_diag(sc, "msleep-error");
 			}
+		}
+		if (err != 0) {
+			if (rk_i2c_diag_enable != 0)
+				device_printf(dev,
+				    "%s transfer error xfer=%u idx=%d err=%d\n",
+				    RK_I2C_DIAG_VERSION, sc->xfer_id, i, err);
+			break;
 		}
 	}
 
@@ -579,6 +721,8 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 
 	if (sc->nak_recv)
 		err = IIC_ENOACK;
+	if (err != 0)
+		rk_i2c_diag(sc, "return-error");
 
 	RK_I2C_UNLOCK(sc);
 	return (err);
@@ -601,10 +745,13 @@ static int
 rk_i2c_attach(device_t dev)
 {
 	struct rk_i2c_softc *sc;
+	uint32_t clkdiv, reg;
 	int error;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	sc->config = (const struct rk_i2c_config *)
+	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 
 	mtx_init(&sc->mtx, device_get_nameunit(dev), "rk_i2c", MTX_DEF);
 
@@ -613,6 +760,10 @@ rk_i2c_attach(device_t dev)
 		error = ENXIO;
 		goto fail;
 	}
+	if (rk_i2c_diag_enable != 0)
+		device_printf(dev, "%s attach mem=%#jx irq=%ju\n",
+		    RK_I2C_DIAG_VERSION, rman_get_start(sc->res[0]),
+		    rman_get_start(sc->res[1]));
 
 	if (bus_setup_intr(dev, sc->res[1],
 	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, rk_i2c_intr, sc,
@@ -621,6 +772,11 @@ rk_i2c_attach(device_t dev)
 		device_printf(dev, "cannot setup interrupt handler\n");
 		return (ENXIO);
 	}
+
+	error = fdt_pinctrl_configure_by_name(dev, "default");
+	if (rk_i2c_diag_enable != 0)
+		device_printf(dev, "%s pinctrl default rv=%d\n",
+		    RK_I2C_DIAG_VERSION, error);
 
 	clk_set_assigned(dev, ofw_bus_get_node(dev));
 
@@ -635,6 +791,13 @@ rk_i2c_attach(device_t dev)
 		device_printf(dev, "cannot enable i2c clock\n");
 		goto fail;
 	}
+	if (rk_i2c_diag_enable != 0) {
+		uint64_t freq;
+
+		if (clk_get_freq(sc->sclk, &freq) == 0)
+			device_printf(dev, "%s i2c clock freq=%ju\n",
+			    RK_I2C_DIAG_VERSION, (uintmax_t)freq);
+	}
 	/* pclk clock is optional. */
 	error = clk_get_by_ofw_name(dev, 0, "pclk", &sc->pclk);
 	if (error != 0 && error != ENOENT) {
@@ -647,7 +810,36 @@ rk_i2c_attach(device_t dev)
 			device_printf(dev, "cannot enable pclk clock\n");
 			goto fail;
 		}
+		if (rk_i2c_diag_enable != 0) {
+			uint64_t freq;
+
+			if (clk_get_freq(sc->pclk, &freq) == 0)
+				device_printf(dev, "%s pclk freq=%ju\n",
+				    RK_I2C_DIAG_VERSION, (uintmax_t)freq);
+		}
 	}
+
+	error = rk_i2c_calc_timing(sc, RK_I2C_DEFAULT_BUS_FREQ, &clkdiv,
+	    &sc->tuning);
+	if (error != 0) {
+		device_printf(dev, "cannot calculate default bus timing\n");
+		goto fail;
+	}
+	RK_I2C_LOCK(sc);
+	RK_I2C_WRITE(sc, RK_I2C_CLKDIV, clkdiv);
+	reg = RK_I2C_READ(sc, RK_I2C_CON);
+	reg &= ~RK_I2C_CON_CTRL_MASK;
+	if (rk_i2c_has_con_tuning(sc)) {
+		reg &= ~RK_I2C_CON_TUNING_MASK;
+		reg |= sc->tuning;
+	}
+	RK_I2C_WRITE(sc, RK_I2C_CON, reg);
+	RK_I2C_UNLOCK(sc);
+	if (rk_i2c_diag_enable != 0)
+		device_printf(dev,
+		    "%s attach default busfreq=%u clkdiv=0x%08x tuning=0x%08x\n",
+		    RK_I2C_DIAG_VERSION, RK_I2C_DEFAULT_BUS_FREQ, clkdiv,
+		    sc->tuning);
 
 	sc->iicbus = device_add_child(dev, "iicbus", -1);
 	if (sc->iicbus == NULL) {
@@ -707,6 +899,14 @@ static device_method_t rk_i2c_methods[] = {
 	DEVMETHOD(device_probe,		rk_i2c_probe),
 	DEVMETHOD(device_attach,	rk_i2c_attach),
 	DEVMETHOD(device_detach,	rk_i2c_detach),
+
+	/* Bus methods */
+	DEVMETHOD(bus_setup_intr,	bus_generic_setup_intr),
+	DEVMETHOD(bus_teardown_intr,	bus_generic_teardown_intr),
+	DEVMETHOD(bus_alloc_resource,	bus_generic_alloc_resource),
+	DEVMETHOD(bus_release_resource,	bus_generic_release_resource),
+	DEVMETHOD(bus_activate_resource, bus_generic_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, bus_generic_deactivate_resource),
 
 	/* OFW methods */
 	DEVMETHOD(ofw_bus_get_node,		rk_i2c_get_node),

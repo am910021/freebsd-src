@@ -36,6 +36,10 @@
 #include <sys/malloc.h>
 #include <sys/bus.h>
 #include <sys/cpu.h>
+#ifdef __aarch64__
+#include <sys/pcpu.h>
+#include <machine/cpu.h>
+#endif
 #include <machine/bus.h>
 
 #include <dev/ofw/openfirm.h>
@@ -156,6 +160,113 @@ struct ofw_cpu_softc {
 	pcell_t		 sc_reg[2];
 };
 
+#ifdef __aarch64__
+static uint32_t
+ofw_cpu_get_u32(phandle_t node, const char *property)
+{
+	pcell_t value;
+
+	if (node <= 0)
+		return (0);
+	if (OF_getencprop(node, property, &value, sizeof(value)) !=
+	    sizeof(value))
+		return (0);
+	return (value);
+}
+
+static phandle_t
+ofw_cpu_next_cache(phandle_t node)
+{
+	pcell_t xref;
+
+	if (node <= 0)
+		return (0);
+	if (OF_getencprop(node, "next-level-cache", &xref, sizeof(xref)) !=
+	    sizeof(xref))
+		return (0);
+	return (OF_node_from_xref(xref));
+}
+
+static bool
+ofw_cpu_get_flat_topology(phandle_t node, u_int *cluster_id, u_int *core_id)
+{
+	phandle_t cluster, core, cpus, map;
+	pcell_t xref;
+	u_int cluster_index, core_index;
+
+	cpus = OF_parent(node);
+	map = ofw_bus_find_child(cpus, "cpu-map");
+	if (map == 0)
+		return (false);
+
+	cluster_index = 0;
+	for (cluster = OF_child(map); cluster != 0;
+	    cluster = OF_peer(cluster), cluster_index++) {
+		core_index = 0;
+		for (core = OF_child(cluster); core != 0;
+		    core = OF_peer(core), core_index++) {
+			if (OF_getencprop(core, "cpu", &xref, sizeof(xref)) !=
+			    sizeof(xref))
+				continue;
+			if (OF_node_from_xref(xref) != node)
+				continue;
+			*cluster_id = cluster_index;
+			*core_id = core_index;
+			return (true);
+		}
+	}
+
+	return (false);
+}
+
+static void
+ofw_cpu_set_desc(device_t dev, struct ofw_cpu_softc *sc, phandle_t node)
+{
+	const char *model;
+	phandle_t l2_node, l3_node;
+	uint32_t l1d_size, l1i_size, l2_size, l3_size, midr;
+	u_int cluster_id, core_id;
+
+	if (sc->sc_cpu_pcpu == NULL)
+		return;
+
+	midr = sc->sc_cpu_pcpu->pc_midr;
+	if (CPU_IMPL(midr) != CPU_IMPL_ARM)
+		return;
+
+	switch (CPU_PART(midr)) {
+	case CPU_PART_CORTEX_A55:
+		model = "ARM Cortex-A55";
+		break;
+	case CPU_PART_CORTEX_A76:
+		model = "ARM Cortex-A76";
+		break;
+	default:
+		return;
+	}
+
+	l1i_size = ofw_cpu_get_u32(node, "i-cache-size");
+	l1d_size = ofw_cpu_get_u32(node, "d-cache-size");
+	l2_node = ofw_cpu_next_cache(node);
+	l2_size = ofw_cpu_get_u32(l2_node, "cache-size");
+	l3_node = ofw_cpu_next_cache(l2_node);
+	l3_size = ofw_cpu_get_u32(l3_node, "cache-size");
+
+	if (ofw_cpu_get_flat_topology(node, &cluster_id, &core_id) &&
+	    l1i_size != 0 && l1d_size != 0 && l2_size != 0 && l3_size != 0) {
+		device_set_descf(dev,
+		    "%s r%dp%d, cluster %u core %u, "
+		    "L1I/D %u/%uKB, L2 %uKB, L3 %uKB",
+		    model, CPU_VAR(midr), CPU_REV(midr), cluster_id, core_id,
+		    l1i_size / 1024, l1d_size / 1024, l2_size / 1024,
+		    l3_size / 1024);
+	} else {
+		device_set_descf(dev, "%s r%dp%d", model, CPU_VAR(midr),
+		    CPU_REV(midr));
+	}
+}
+#endif
+
 static device_method_t ofw_cpu_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		ofw_cpu_probe),
@@ -274,6 +385,10 @@ ofw_cpu_attach(device_t dev)
 	} else
 #endif
 	sc->sc_cpu_pcpu = pcpu_find(device_get_unit(dev));
+
+#ifdef __aarch64__
+	ofw_cpu_set_desc(dev, sc, node);
+#endif
 
 	if (OF_getencprop(node, "clock-frequency", &cell, sizeof(cell)) < 0) {
 #if defined(__arm__) || defined(__arm64__) || defined(__riscv__)

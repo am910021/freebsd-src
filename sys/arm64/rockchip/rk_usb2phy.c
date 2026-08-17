@@ -45,24 +45,17 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <dev/extres/clk/clk.h>
+#include <dev/extres/hwreset/hwreset.h>
 #include <dev/extres/phy/phy_usb.h>
 #include <dev/extres/regulator/regulator.h>
 #include <dev/extres/syscon/syscon.h>
 
 #include "clkdev_if.h"
+#include "opt_soc.h"
+#include "rk_usb2phy.h"
 #include "syscon_if.h"
 
-struct rk_usb2phy_reg {
-	uint32_t	offset;
-	uint32_t	enable_mask;
-	uint32_t	disable_mask;
-};
-
-struct rk_usb2phy_regs {
-	struct rk_usb2phy_reg	clk_ctl;
-};
-
-struct rk_usb2phy_regs rk3399_regs = {
+static const struct rk_usb2phy_regs rk3399_regs = {
 	.clk_ctl = {
 		.offset = 0x0000,
 		/* bit 4 put pll in suspend */
@@ -71,7 +64,7 @@ struct rk_usb2phy_regs rk3399_regs = {
 	}
 };
 
-struct rk_usb2phy_regs rk3568_regs = {
+static const struct rk_usb2phy_regs rk3568_regs = {
 	.clk_ctl = {
 		.offset = 0x0008,
 		.enable_mask = 0x100000,
@@ -83,15 +76,10 @@ struct rk_usb2phy_regs rk3568_regs = {
 static struct ofw_compat_data compat_data[] = {
 	{ "rockchip,rk3399-usb2phy",	(uintptr_t)&rk3399_regs },
 	{ "rockchip,rk3568-usb2phy",	(uintptr_t)&rk3568_regs },
+#ifdef SOC_ROCKCHIP_RK3588
+	{ "rockchip,rk3588-usb2phy",	(uintptr_t)&rk3588_usb2phy_regs },
+#endif
 	{ NULL,				0 }
-};
-
-struct rk_usb2phy_softc {
-	device_t		dev;
-	struct syscon		*grf;
-	regulator_t		phy_supply;
-	clk_t			clk;
-	int			mode;
 };
 
 /* Phy class and methods. */
@@ -110,10 +98,16 @@ DEFINE_CLASS_1(rk_usb2phy_phynode, rk_usb2phy_phynode_class,
     rk_usb2phy_phynode_methods,
     sizeof(struct phynode_usb_sc), phynode_usb_class);
 
-enum RK_USBPHY {
-	RK_USBPHY_HOST = 0,
-	RK_USBPHY_OTG,
-};
+static bool
+rk_usb2phy_valid_phy(struct rk_usb2phy_softc *sc, intptr_t phy)
+{
+
+	if (phy == RK_USBPHY_HOST)
+		return (true);
+	if (sc->regs.has_otg && phy == RK_USBPHY_OTG)
+		return (true);
+	return (false);
+}
 
 static int
 rk_usb2phy_enable(struct phynode *phynode, bool enable)
@@ -127,8 +121,11 @@ rk_usb2phy_enable(struct phynode *phynode, bool enable)
 	phy = phynode_get_id(phynode);
 	sc = device_get_softc(dev);
 
-	if (phy != RK_USBPHY_HOST)
+	if (!rk_usb2phy_valid_phy(sc, phy))
 		return (ERANGE);
+
+	if (sc->regs.enable != NULL)
+		return (sc->regs.enable(sc, phy, enable));
 
 	if (sc->phy_supply) {
 		if (enable)
@@ -140,6 +137,12 @@ rk_usb2phy_enable(struct phynode *phynode, bool enable)
 			    enable ? "En" : "Dis");
 			goto fail;
 		}
+	}
+
+	if (sc->regs.has_host_ctl) {
+		SYSCON_WRITE_4(sc->grf, sc->regs.host_ctl.offset,
+		    enable ? sc->regs.host_ctl.enable_mask :
+		    sc->regs.host_ctl.disable_mask);
 	}
 
 	return (0);
@@ -158,7 +161,7 @@ rk_usb2phy_get_mode(struct phynode *phynode, int *mode)
 	phy = phynode_get_id(phynode);
 	sc = device_get_softc(dev);
 
-	if (phy != RK_USBPHY_HOST)
+	if (!rk_usb2phy_valid_phy(sc, phy))
 		return (ERANGE);
 
 	*mode = sc->mode;
@@ -177,7 +180,7 @@ rk_usb2phy_set_mode(struct phynode *phynode, int mode)
 	phy = phynode_get_id(phynode);
 	sc = device_get_softc(dev);
 
-	if (phy != RK_USBPHY_HOST)
+	if (!rk_usb2phy_valid_phy(sc, phy))
 		return (ERANGE);
 
 	sc->mode = mode;
@@ -187,9 +190,10 @@ rk_usb2phy_set_mode(struct phynode *phynode, int mode)
 
 /* Clock class and method */
 struct rk_usb2phy_clk_sc {
-	device_t	clkdev;
 	struct syscon	*grf;
 	struct rk_usb2phy_regs	*regs;
+	uint32_t	reg_base;
+	uint32_t	clk_ctl_offset;
 };
 
 static int
@@ -204,15 +208,24 @@ static int
 rk_usb2phy_clk_set_gate(struct clknode *clk, bool enable)
 {
 	struct rk_usb2phy_clk_sc *sc;
+	uint32_t before, val;
 
 	sc = clknode_get_softc(clk);
-
+	before = SYSCON_READ_4(sc->grf, sc->clk_ctl_offset);
 	if (enable)
-		SYSCON_WRITE_4(sc->grf, sc->regs->clk_ctl.offset,
-		    sc->regs->clk_ctl.enable_mask);
+		val = sc->regs->clk_ctl.enable_mask;
 	else
-		SYSCON_WRITE_4(sc->grf, sc->regs->clk_ctl.offset,
-		    sc->regs->clk_ctl.disable_mask);
+		val = sc->regs->clk_ctl.disable_mask;
+	SYSCON_WRITE_4(sc->grf, sc->clk_ctl_offset, val);
+	if (enable && sc->regs->clock_enable_delay != 0 &&
+	    (before & 0x1) != 0) {
+		/*
+		 * Linux clk480m_prepare() and OpenBSD rkusbphy_phy_supply()
+		 * both wait for the PHY 480MHz output to settle after enabling
+		 * it from an off state.
+		 */
+		DELAY(sc->regs->clock_enable_delay);
+	}
 	return (0);
 }
 
@@ -263,7 +276,6 @@ rk_usb2phy_export_clock(struct rk_usb2phy_softc *devsc)
 	struct clknode *clk;
 	clk_t clk_parent;
 	phandle_t node;
-	phandle_t regs[2];
 	int i, nclocks, ncells, error;
 
 	node = ofw_bus_get_node(devsc->dev);
@@ -305,13 +317,12 @@ rk_usb2phy_export_clock(struct rk_usb2phy_softc *devsc)
 	}
 
 	sc = clknode_get_softc(clk);
-	sc->clkdev = device_get_parent(devsc->dev);
 	sc->grf = devsc->grf;
-	sc->regs = (struct rk_usb2phy_regs *)ofw_bus_search_compatible(devsc->dev, compat_data)->ocd_data;
-	if (sc->regs->clk_ctl.offset == 0) {
-		OF_getencprop(node, "reg", regs, sizeof(regs));
-		sc->regs->clk_ctl.offset = regs[0];
-	}
+	sc->regs = &devsc->regs;
+	sc->reg_base = devsc->reg_base;
+	sc->clk_ctl_offset = sc->regs->clk_ctl.offset;
+	if (sc->regs->clk_ctl.offset == 0 && !sc->regs->relative_offsets)
+		sc->clk_ctl_offset += sc->reg_base;
 	clknode_register(clkdom, clk);
 
 	if (clkdom_finit(clkdom) != 0) {
@@ -346,12 +357,17 @@ rk_usb2phy_attach(device_t dev)
 	struct phynode_init_def phy_init;
 	struct phynode *phynode;
 	phandle_t node, host;
-	int err;
+	phandle_t regs[2];
+	const struct ofw_compat_data *compat;
+	int err, phy_id;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 	node = ofw_bus_get_node(dev);
-
+	compat = ofw_bus_search_compatible(dev, compat_data);
+	sc->regs = *(struct rk_usb2phy_regs *)compat->ocd_data;
+	if (OF_getencprop(node, "reg", regs, sizeof(regs)) > 0)
+		sc->reg_base = regs[0];
 	if (OF_hasprop(node, "rockchip,usbgrf")) {
 		if (syscon_get_by_ofw_property(dev, node, "rockchip,usbgrf",
 		    &sc->grf)) {
@@ -370,11 +386,34 @@ rk_usb2phy_attach(device_t dev)
 		device_printf(dev, "Cannot get clock\n");
 		return (ENXIO);
 	}
-	err = clk_enable(sc->clk);
-	if (err != 0) {
-		device_printf(dev, "Could not enable clock %s\n",
-		    clk_get_name(sc->clk));
-		return (ENXIO);
+	err = hwreset_array_get_ofw(dev, node, &sc->resets);
+	if (err == 0) {
+		err = hwreset_array_deassert(sc->resets);
+		if (err != 0) {
+			device_printf(dev,
+			    "cannot deassert USB2PHY resets error=%d\n", err);
+			return (ENXIO);
+		}
+		DELAY(10);
+	} else {
+		sc->resets = NULL;
+		if (sc->regs.resets_required) {
+			device_printf(dev,
+			    "required USB2PHY reset array missing error=%d\n",
+			    err);
+			return (ENXIO);
+		}
+		if (bootverbose)
+			device_printf(dev, "no USB2PHY reset array error=%d\n",
+			    err);
+	}
+	if (sc->regs.enable == NULL) {
+		err = clk_enable(sc->clk);
+		if (err != 0) {
+			device_printf(dev, "Could not enable clock %s\n",
+			    clk_get_name(sc->clk));
+			return (ENXIO);
+		}
 	}
 
 	err = rk_usb2phy_export_clock(sc);
@@ -384,18 +423,32 @@ rk_usb2phy_attach(device_t dev)
 	/* Only host is supported right now */
 
 	host = ofw_bus_find_child(node, "host-port");
-	if (host == 0) {
-		device_printf(dev, "Cannot find host-port child node\n");
-		return (ENXIO);
+	phy_id = RK_USBPHY_HOST;
+	if (host == 0 && sc->regs.has_otg) {
+		host = ofw_bus_find_child(node, "otg-port");
+		phy_id = RK_USBPHY_OTG;
 	}
-
-	if (!ofw_bus_node_status_okay(host)) {
-		device_printf(dev, "host-port isn't okay\n");
+	sc->host_node = host;
+	if (host == 0) {
+		/*
+		 * Some instances only provide the exported 480MHz clock for
+		 * companion PHY users.  Keep the clock domain registered and
+		 * avoid duplicate registration on a later bus pass.
+		 */
 		return (0);
 	}
 
-	regulator_get_by_ofw_property(dev, host, "phy-supply", &sc->phy_supply);
-	phy_init.id = RK_USBPHY_HOST;
+	if (!ofw_bus_node_status_okay(host)) {
+		device_printf(dev, "PHY port node isn't okay id=%d\n", phy_id);
+		return (0);
+	}
+	if (sc->regs.port_init != NULL)
+		sc->regs.port_init(sc, phy_id);
+
+	if (sc->regs.enable == NULL)
+		regulator_get_by_ofw_property(dev, host, "phy-supply",
+		    &sc->phy_supply);
+	phy_init.id = phy_id;
 	phy_init.ofw_node = host;
 	phynode = phynode_create(dev, &rk_usb2phy_phynode_class, &phy_init);
 	if (phynode == NULL) {

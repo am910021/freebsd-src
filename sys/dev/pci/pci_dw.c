@@ -53,6 +53,7 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcib_private.h>
 #include <dev/pci/pci_dw.h>
+#include <dev/pci/pci_dw_soc.h>
 
 #include "pcib_if.h"
 #include "pci_dw_if.h"
@@ -132,10 +133,22 @@ pci_dw_dbi_write(device_t dev, u_int reg, uint32_t val, int width)
 	}
 }
 
-static void
+bool
+pci_dw_is_soc(device_t dev)
+{
+	struct pci_dw_softc *sc;
+
+	sc = device_get_softc(dev);
+	return (pci_dw_soc_active(sc));
+}
+
+void
 pci_dw_dbi_protect(struct pci_dw_softc *sc, bool protect)
 {
 	uint32_t reg;
+
+	if (!pci_dw_soc_prepare_dbi_protect(sc, protect))
+		return;
 
 	reg = DBI_RD4(sc, DW_MISC_CONTROL_1);
 	if (protect)
@@ -198,6 +211,27 @@ pci_dw_detect_out_atu_regions_unroll(struct pci_dw_softc *sc)
 }
 
 static int
+pci_dw_detect_in_atu_regions_unroll(struct pci_dw_softc *sc)
+{
+	int num_regions, i;
+	uint32_t reg;
+
+	num_regions = sc->iatu_ur_size / DW_IATU_UR_STEP;
+
+	for (i = 0; i < num_regions; ++i) {
+		IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(i, LWR_TARGET_ADDR),
+		    0x12340000);
+		reg = IATU_UR_RD4(sc, DW_IATU_UR_IB_REG(i, LWR_TARGET_ADDR));
+		if (reg != 0x12340000)
+			break;
+	}
+
+	sc->num_in_regions = i;
+
+	return (0);
+}
+
+static int
 pci_dw_detect_out_atu_regions_legacy(struct pci_dw_softc *sc)
 {
 	int num_viewports, i;
@@ -241,6 +275,33 @@ pci_dw_detect_out_atu_regions(struct pci_dw_softc *sc)
 		return (pci_dw_detect_out_atu_regions_legacy(sc));
 }
 
+static void
+pci_dw_disable_atu_unroll(struct pci_dw_softc *sc, bool inbound, int idx)
+{
+
+	if (inbound)
+		IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, CTRL2), 0);
+	else
+		IATU_UR_WR4(sc, DW_IATU_UR_REG(idx, CTRL2), 0);
+}
+
+void
+pci_dw_disable_all_atu_unroll(struct pci_dw_softc *sc)
+{
+	int i;
+
+	if (sc->iatu_ur_res == NULL)
+		return;
+
+	if (!pci_dw_soc_prepare_iatu_unroll(sc))
+		return;
+
+	for (i = 0; i < sc->num_out_regions; i++)
+		pci_dw_disable_atu_unroll(sc, false, i);
+	for (i = 0; i < sc->num_in_regions; i++)
+		pci_dw_disable_atu_unroll(sc, true, i);
+}
+
 static int
 pci_dw_map_out_atu_unroll(struct pci_dw_softc *sc, int idx, int type,
     uint64_t pa, uint64_t pci_addr, uint32_t size)
@@ -249,6 +310,9 @@ pci_dw_map_out_atu_unroll(struct pci_dw_softc *sc, int idx, int type,
 	int i;
 
 	if (size == 0)
+		return (0);
+
+	if (!pci_dw_soc_prepare_iatu_unroll(sc))
 		return (0);
 
 	IATU_UR_WR4(sc, DW_IATU_UR_REG(idx, LWR_BASE_ADDR),
@@ -325,14 +389,129 @@ pci_dw_map_out_atu(struct pci_dw_softc *sc, int idx, int type,
 }
 
 static int
-pci_dw_setup_hw(struct pci_dw_softc *sc)
+pci_dw_map_in_atu_unroll(struct pci_dw_softc *sc, int idx, int type,
+    uint64_t pa, uint64_t pci_addr, uint64_t size)
 {
-	uint32_t reg;
-	int rv, i;
+	uint64_t limit;
+	uint32_t ctrl1, ctrl2;
+	int i;
 
-	pci_dw_dbi_protect(sc, false);
+	if (size == 0)
+		return (0);
 
-	/* Setup config registers */
+	limit = pci_addr + size - 1;
+	ctrl1 = IATU_CTRL1_TYPE(type);
+	if ((limit >> 32) > (pci_addr >> 32))
+		ctrl1 |= IATU_CTRL1_INCREASE_REGION_SIZE;
+
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, LWR_BASE_ADDR),
+	    pci_addr & 0xffffffff);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, UPPER_BASE_ADDR),
+	    (pci_addr >> 32) & 0xffffffff);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, LIMIT_ADDR),
+	    limit & 0xffffffff);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, UPPER_LIMIT_ADDR),
+	    (limit >> 32) & 0xffffffff);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, LWR_TARGET_ADDR),
+	    pa & 0xffffffff);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, UPPER_TARGET_ADDR),
+	    (pa >> 32) & 0xffffffff);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, CTRL1), ctrl1);
+	IATU_UR_WR4(sc, DW_IATU_UR_IB_REG(idx, CTRL2),
+	    IATU_CTRL2_REGION_EN);
+
+	for (i = 10; i > 0; i--) {
+		ctrl2 = IATU_UR_RD4(sc, DW_IATU_UR_IB_REG(idx, CTRL2));
+		if ((ctrl2 & IATU_CTRL2_REGION_EN) != 0)
+			break;
+		DELAY(5);
+	}
+
+	if ((ctrl2 & IATU_CTRL2_REGION_EN) == 0) {
+		device_printf(sc->dev,
+		    "Cannot map inbound region %d in unroll mode iATU\n", idx);
+		return (ETIMEDOUT);
+	}
+
+	return (0);
+}
+
+static void
+pci_dw_setup_bridge_windows(struct pci_dw_softc *sc)
+{
+	uint64_t start, end;
+	uint16_t base, limit;
+	uint8_t base8, limit8;
+	int i, memidx, pmemidx;
+
+	memidx = -1;
+	pmemidx = -1;
+	for (i = 0; i < sc->num_mem_ranges; i++) {
+		if (sc->mem_ranges[i].size == 0)
+			continue;
+		if ((sc->mem_ranges[i].pci_hi & OFW_PCI_PHYS_HI_PREFETCHABLE) ||
+		    pci_dw_soc_mem_range_prefetch(sc, &sc->mem_ranges[i])) {
+			if (pmemidx < 0)
+				pmemidx = i;
+		} else if (sc->mem_ranges[i].pci <= UINT32_MAX) {
+			if (memidx < 0)
+				memidx = i;
+		}
+	}
+
+	if (memidx >= 0) {
+		start = sc->mem_ranges[memidx].pci;
+		end = start + sc->mem_ranges[memidx].size - 1;
+		if (end > UINT32_MAX)
+			end = UINT32_MAX;
+		base = (start >> 16) & 0xfff0;
+		limit = (end >> 16) & 0xfff0;
+		DBI_WR2(sc, PCIR_MEMBASE_1, base);
+		DBI_WR2(sc, PCIR_MEMLIMIT_1, limit);
+	} else {
+		DBI_WR2(sc, PCIR_MEMBASE_1, 0xfff0);
+		DBI_WR2(sc, PCIR_MEMLIMIT_1, 0);
+	}
+
+	if (sc->io_range.size != 0 && sc->io_range.pci <= UINT32_MAX) {
+		start = sc->io_range.pci;
+		end = start + sc->io_range.size - 1;
+		if (end > UINT32_MAX)
+			end = UINT32_MAX;
+		base8 = ((start >> 8) & 0xf0) | PCIM_BRIO_32;
+		limit8 = ((end >> 8) & 0xf0) | PCIM_BRIO_32;
+		DBI_WR1(sc, PCIR_IOBASEL_1, base8);
+		DBI_WR1(sc, PCIR_IOLIMITL_1, limit8);
+		DBI_WR2(sc, PCIR_IOBASEH_1, (start >> 16) & 0xffff);
+		DBI_WR2(sc, PCIR_IOLIMITH_1, (end >> 16) & 0xffff);
+	} else {
+		DBI_WR1(sc, PCIR_IOBASEL_1, 0xf0 | PCIM_BRIO_32);
+		DBI_WR1(sc, PCIR_IOLIMITL_1, PCIM_BRIO_32);
+		DBI_WR2(sc, PCIR_IOBASEH_1, 0xffff);
+		DBI_WR2(sc, PCIR_IOLIMITH_1, 0);
+	}
+
+	if (pmemidx >= 0) {
+		start = sc->mem_ranges[pmemidx].pci;
+		end = start + sc->mem_ranges[pmemidx].size - 1;
+		base = ((start >> 16) & 0xfff0) | PCIM_BRPM_64;
+		limit = ((end >> 16) & 0xfff0) | PCIM_BRPM_64;
+		DBI_WR4(sc, PCIR_PMBASEH_1, (uint32_t)(start >> 32));
+		DBI_WR4(sc, PCIR_PMLIMITH_1, (uint32_t)(end >> 32));
+		DBI_WR2(sc, PCIR_PMBASEL_1, base);
+		DBI_WR2(sc, PCIR_PMLIMITL_1, limit);
+	} else {
+		DBI_WR2(sc, PCIR_PMBASEL_1, 0xfff0);
+		DBI_WR2(sc, PCIR_PMLIMITL_1, 0);
+		DBI_WR4(sc, PCIR_PMBASEH_1, 0xffffffff);
+		DBI_WR4(sc, PCIR_PMLIMITH_1, 0);
+	}
+}
+
+void
+pci_dw_setup_root_config(struct pci_dw_softc *sc)
+{
+
 	DBI_WR1(sc, PCIR_CLASS, PCIC_BRIDGE);
 	DBI_WR1(sc, PCIR_SUBCLASS, PCIS_BRIDGE_PCI);
 	DBI_WR4(sc, PCIR_BAR(0), 4);
@@ -341,9 +520,61 @@ pci_dw_setup_hw(struct pci_dw_softc *sc)
 	DBI_WR1(sc, PCIR_PRIBUS_1, sc->root_bus);
 	DBI_WR1(sc, PCIR_SECBUS_1, sc->sub_bus);
 	DBI_WR1(sc, PCIR_SUBBUS_1, sc->bus_end);
+	pci_dw_setup_bridge_windows(sc);
 	DBI_WR2(sc, PCIR_COMMAND,
 	   PCIM_CMD_PORTEN | PCIM_CMD_MEMEN |
 	   PCIM_CMD_BUSMASTEREN | PCIM_CMD_SERRESPEN);
+
+	pci_dw_soc_root_config_done(sc);
+}
+
+int
+pci_dw_map_outbound_windows(struct pci_dw_softc *sc)
+{
+	int rv, i;
+
+	for (i = 0; i < min(sc->num_mem_ranges, sc->num_out_regions - 1); ++i) {
+		rv = pci_dw_map_out_atu(sc, i + 1, IATU_CTRL1_TYPE_MEM,
+		    sc->mem_ranges[i].host, sc->mem_ranges[i].pci,
+		    sc->mem_ranges[i].size);
+		if (rv != 0)
+			return (rv);
+	}
+
+	if (sc->num_mem_ranges + 1 < sc->num_out_regions &&
+	    sc->io_range.size != 0) {
+		rv = pci_dw_map_out_atu(sc, sc->num_mem_ranges + 1,
+		    IATU_CTRL1_TYPE_IO, sc->io_range.host, sc->io_range.pci,
+		    sc->io_range.size);
+		if (rv != 0)
+			return (rv);
+	}
+
+	return (0);
+}
+
+static int
+pci_dw_setup_hw(struct pci_dw_softc *sc)
+{
+	uint32_t reg;
+	int rv, i;
+
+	pci_dw_dbi_protect(sc, false);
+
+	/* Setup config registers */
+	if (!pci_dw_soc_suppress_root_config(sc)) {
+		DBI_WR1(sc, PCIR_CLASS, PCIC_BRIDGE);
+		DBI_WR1(sc, PCIR_SUBCLASS, PCIS_BRIDGE_PCI);
+		DBI_WR4(sc, PCIR_BAR(0), 4);
+		DBI_WR4(sc, PCIR_BAR(1), 0);
+		DBI_WR1(sc, PCIR_INTPIN, 1);
+		DBI_WR1(sc, PCIR_PRIBUS_1, sc->root_bus);
+		DBI_WR1(sc, PCIR_SECBUS_1, sc->sub_bus);
+		DBI_WR1(sc, PCIR_SUBBUS_1, sc->bus_end);
+		DBI_WR2(sc, PCIR_COMMAND,
+		   PCIM_CMD_PORTEN | PCIM_CMD_MEMEN |
+		   PCIM_CMD_BUSMASTEREN | PCIM_CMD_SERRESPEN);
+	}
 	pci_dw_dbi_protect(sc, true);
 
 	/* Setup outbound memory windows */
@@ -365,6 +596,9 @@ pci_dw_setup_hw(struct pci_dw_softc *sc)
 		if (rv != 0)
 			return (rv);
 	}
+
+	if (pci_dw_soc_active(sc))
+		return (0);
 
 	/* Adjust number of lanes */
 	reg = DBI_RD4(sc, DW_PORT_LINK_CTRL);
@@ -428,16 +662,65 @@ pci_dw_setup_hw(struct pci_dw_softc *sc)
 	return (0);
 }
 
+int
+pci_dw_find_capability(struct pci_dw_softc *sc, int capability, uint8_t *capreg)
+{
+	uint16_t status;
+	uint8_t ptr, cap;
+	int ttl;
+
+	status = DBI_RD2(sc, PCIR_STATUS);
+	if ((status & PCIM_STATUS_CAPPRESENT) == 0)
+		return (ENXIO);
+
+	ptr = DBI_RD1(sc, PCIR_CAP_PTR);
+	ptr &= ~0x3;
+	for (ttl = 48; ptr != 0 && ttl > 0; ttl--) {
+		cap = DBI_RD1(sc, ptr + PCICAP_ID);
+		if (cap == capability) {
+			*capreg = ptr;
+			return (0);
+		}
+		ptr = DBI_RD1(sc, ptr + PCICAP_NEXTPTR);
+		ptr &= ~0x3;
+	}
+
+	return (ENXIO);
+}
+
+int
+pci_dw_find_extcapability(struct pci_dw_softc *sc, int capability,
+    uint16_t *capreg)
+{
+	uint32_t ecap;
+	uint16_t ptr;
+	int ttl;
+
+	for (ptr = PCIR_EXTCAP, ttl = 480; ptr != 0 && ttl > 0; ttl--) {
+		ecap = DBI_RD4(sc, ptr);
+		if (PCI_EXTCAP_ID(ecap) == capability) {
+			*capreg = ptr;
+			return (0);
+		}
+		ptr = PCI_EXTCAP_NEXTPTR(ecap);
+		ptr &= ~0x3;
+	}
+
+	return (ENXIO);
+}
+
 static int
 pci_dw_decode_ranges(struct pci_dw_softc *sc, struct ofw_pci_range *ranges,
      int nranges)
 {
 	int i, nmem, rv;
+	uint32_t space;
 
 	nmem = 0;
 	for (i = 0; i < nranges; i++) {
-		if ((ranges[i].pci_hi & OFW_PCI_PHYS_HI_SPACEMASK) ==
-		    OFW_PCI_PHYS_HI_SPACE_MEM32)
+		space = ranges[i].pci_hi & OFW_PCI_PHYS_HI_SPACEMASK;
+		if (space == OFW_PCI_PHYS_HI_SPACE_MEM32 ||
+		    space == OFW_PCI_PHYS_HI_SPACE_MEM64)
 			++nmem;
 	}
 
@@ -465,8 +748,9 @@ pci_dw_decode_ranges(struct pci_dw_softc *sc, struct ofw_pci_range *ranges,
 				sc->io_range.size = UINT32_MAX;
 			}
 		}
-		if ((ranges[i].pci_hi & OFW_PCI_PHYS_HI_SPACEMASK) ==
-		    OFW_PCI_PHYS_HI_SPACE_MEM32) {
+		space = ranges[i].pci_hi & OFW_PCI_PHYS_HI_SPACEMASK;
+		if (space == OFW_PCI_PHYS_HI_SPACE_MEM32 ||
+		    space == OFW_PCI_PHYS_HI_SPACE_MEM64) {
 			MPASS(nmem < sc->num_mem_ranges);
 			sc->mem_ranges[nmem] = ranges[i];
 			if (sc->mem_ranges[nmem].size > UINT32_MAX) {
@@ -492,6 +776,8 @@ pci_dw_decode_ranges(struct pci_dw_softc *sc, struct ofw_pci_range *ranges,
 
 out:
 	free(sc->mem_ranges, M_DEVBUF);
+	sc->mem_ranges = NULL;
+	sc->num_mem_ranges = 0;
 	return (rv);
 }
 
@@ -513,6 +799,10 @@ pci_dw_read_config(device_t dev, u_int bus, u_int slot,
 	sc = device_get_softc(dev);
 
 	if (!pci_dw_check_dev(sc, bus, slot, func, reg))
+		return (0xFFFFFFFFU);
+
+	if (__predict_false((bytes == 2 && (reg & 1) != 0) ||
+	    (bytes == 4 && (reg & 3) != 0)))
 		return (0xFFFFFFFFU);
 
 	if (bus == sc->root_bus) {
@@ -562,6 +852,10 @@ pci_dw_write_config(device_t dev, u_int bus, u_int slot,
 	if (!pci_dw_check_dev(sc, bus, slot, func, reg))
 		return;
 
+	if (__predict_false((bytes == 2 && (reg & 1) != 0) ||
+	    (bytes == 4 && (reg & 3) != 0)))
+		return;
+
 	if (bus == sc->root_bus) {
 		res = (sc->dbi_res);
 	} else {
@@ -599,8 +893,10 @@ pci_dw_alloc_msi(device_t pci, device_t child, int count,
 {
 	phandle_t msi_parent;
 	int rv;
+	uint16_t rid;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
+	rid = pci_get_rid(child);
+	rv = ofw_bus_msimap(ofw_bus_get_node(pci), rid,
 	    &msi_parent, NULL);
 	if (rv != 0)
 		return (rv);
@@ -628,8 +924,10 @@ pci_dw_map_msi(device_t pci, device_t child, int irq, uint64_t *addr,
 {
 	phandle_t msi_parent;
 	int rv;
+	uint16_t rid;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
+	rid = pci_get_rid(child);
+	rv = ofw_bus_msimap(ofw_bus_get_node(pci), rid,
 	    &msi_parent, NULL);
 	if (rv != 0)
 		return (rv);
@@ -642,8 +940,10 @@ pci_dw_alloc_msix(device_t pci, device_t child, int *irq)
 {
 	phandle_t msi_parent;
 	int rv;
+	uint16_t rid;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
+	rid = pci_get_rid(child);
+	rv = ofw_bus_msimap(ofw_bus_get_node(pci), rid,
 	    &msi_parent, NULL);
 	if (rv != 0)
 		return (rv);
@@ -664,6 +964,29 @@ pci_dw_release_msix(device_t pci, device_t child, int irq)
 }
 
 static int
+pci_dw_get_iommu(device_t pci, device_t child, uintptr_t *id)
+{
+	struct pci_id_ofw_iommu *iommu;
+	phandle_t node;
+	uint32_t iommu_rid;
+	uint32_t iommu_xref;
+	uint16_t pci_rid;
+	int rv;
+
+	node = ofw_bus_get_node(pci);
+	pci_rid = pci_get_rid(child);
+	iommu = (struct pci_id_ofw_iommu *)id;
+
+	rv = ofw_bus_iommu_map(node, pci_rid, &iommu_xref, &iommu_rid);
+	if (rv == 0) {
+		iommu->id = iommu_rid;
+		iommu->xref = iommu_xref;
+	}
+
+	return (rv);
+}
+
+static int
 pci_dw_get_id(device_t pci, device_t child, enum pci_id_type type,
     uintptr_t *id)
 {
@@ -671,6 +994,9 @@ pci_dw_get_id(device_t pci, device_t child, enum pci_id_type type,
 	int rv;
 	uint32_t rid;
 	uint16_t pci_rid;
+
+	if (type == PCI_ID_OFW_IOMMU)
+		return (pci_dw_get_iommu(pci, child, id));
 
 	if (type != PCI_ID_MSI)
 		return (pcib_get_id(pci, child, type, id));
@@ -699,18 +1025,70 @@ pci_dw_get_dma_tag(device_t dev, device_t child)
 	return (sc->dmat);
 }
 
-int
-pci_dw_init(device_t dev)
+void
+pci_dw_fini_core(device_t dev)
 {
 	struct pci_dw_softc *sc;
-	int rv, rid;
+
+	sc = device_get_softc(dev);
+
+	if (sc->ofw_pcib_inited) {
+		ofw_pcib_fini(dev);
+		sc->ofw_pcib_inited = false;
+		sc->ofw_pci.sc_initialized = 0;
+		sc->ofw_pci.sc_cell_info = NULL;
+		sc->ofw_pci.sc_range = NULL;
+		sc->ofw_pci.sc_nrange = 0;
+	}
+	if (sc->iatu_ur_allocated) {
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->iatu_ur_rid,
+		    sc->iatu_ur_res);
+		sc->iatu_ur_allocated = false;
+	}
+	sc->iatu_ur_res = NULL;
+	sc->iatu_ur_offset = 0;
+	sc->iatu_ur_size = 0;
+	if (sc->mem_ranges != NULL) {
+		free(sc->mem_ranges, M_DEVBUF);
+		sc->mem_ranges = NULL;
+		sc->num_mem_ranges = 0;
+	}
+	bzero(&sc->io_range, sizeof(sc->io_range));
+	if (sc->cfg_res != NULL) {
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->cfg_rid,
+		    sc->cfg_res);
+		sc->cfg_res = NULL;
+		sc->cfg_pa = 0;
+		sc->cfg_size = 0;
+	}
+	if (sc->dmat_inited) {
+		bus_dma_tag_destroy(sc->dmat);
+		sc->dmat = NULL;
+		sc->dmat_inited = false;
+	}
+	if (sc->mtx_inited) {
+		mtx_destroy(&sc->mtx);
+		sc->mtx_inited = false;
+	}
+
+	pci_dw_soc_fini(sc);
+}
+
+static int
+pci_dw_init_common(device_t dev, bool add_child)
+{
+	struct pci_dw_softc *sc;
+	uint32_t busrange[2];
+	int rv, rid, atu_rid;
 	bool unroll_mode;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 	sc->node = ofw_bus_get_node(dev);
+	pci_dw_soc_init(sc);
 
 	mtx_init(&sc->mtx, "pci_dw_mtx", NULL, MTX_DEF);
+	sc->mtx_inited = true;
 
 	/* XXXn Should not be this configurable ? */
 	sc->bus_start = 0;
@@ -726,6 +1104,10 @@ pci_dw_init(device_t dev)
 	    sizeof(sc->num_lanes));
 	if (rv != sizeof(sc->num_lanes))
 		sc->num_lanes = 1;
+	rv = OF_getencprop(sc->node, "max-link-speed", &sc->max_link_speed,
+	    sizeof(sc->max_link_speed));
+	if (rv != sizeof(sc->max_link_speed))
+		sc->max_link_speed = 0;
 	if (sc->num_lanes != 1 && sc->num_lanes != 2 &&
 	    sc->num_lanes != 4 && sc->num_lanes != 8) {
 		device_printf(dev,
@@ -742,6 +1124,7 @@ pci_dw_init(device_t dev)
 		rv = ENXIO;
 		goto out;
 	}
+	sc->cfg_rid = rid;
 	sc->cfg_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
 	    RF_ACTIVE);
 	if (sc->cfg_res == NULL) {
@@ -771,23 +1154,47 @@ pci_dw_init(device_t dev)
 	    &sc->dmat);
 	if (rv != 0)
 		goto out;
+	sc->dmat_inited = true;
 
 	rv = ofw_pcib_init(dev);
 	if (rv != 0)
 		goto out;
+	sc->ofw_pcib_inited = true;
+	if (OF_getencprop(sc->node, "bus-range", busrange,
+	    sizeof(busrange)) == sizeof(busrange)) {
+		sc->bus_start = busrange[0];
+		sc->bus_end = busrange[1];
+	} else {
+		sc->bus_start = sc->ofw_pci.sc_bus;
+		sc->bus_end = 255;
+	}
+	if (sc->bus_end > 255)
+		sc->bus_end = 255;
+	sc->root_bus = sc->bus_start;
+	sc->sub_bus = (sc->root_bus < sc->bus_end) ?
+	    sc->root_bus + 1 : sc->root_bus;
 	rv = pci_dw_decode_ranges(sc, sc->ofw_pci.sc_range,
 	    sc->ofw_pci.sc_nrange);
 	if (rv != 0)
 		goto out;
 
-	unroll_mode = pci_dw_detect_atu_unroll(sc);
+	atu_rid = -1;
+	rv = ofw_bus_find_string_index(sc->node, "reg-names", "atu",
+	    &atu_rid);
+	if (rv == 0) {
+		unroll_mode = true;
+	} else if (pci_dw_soc_force_unroll(sc, rv)) {
+		unroll_mode = true;
+	} else {
+		unroll_mode = pci_dw_detect_atu_unroll(sc);
+	}
 	if (bootverbose)
 		device_printf(dev, "Using iATU %s mode\n",
 		    unroll_mode ? "unroll" : "legacy");
 	if (unroll_mode) {
-		rid = 0;
-		rv = ofw_bus_find_string_index(sc->node, "reg-names", "atu", &rid);
-		if (rv == 0) {
+		if (atu_rid >= 0) {
+			rid = atu_rid;
+			sc->iatu_ur_rid = rid;
 			sc->iatu_ur_res = bus_alloc_resource_any(dev,
 			    SYS_RES_MEMORY, &rid, RF_ACTIVE);
 			if (sc->iatu_ur_res == NULL) {
@@ -797,37 +1204,69 @@ pci_dw_init(device_t dev)
 				rv = ENXIO;
 				goto out;
 			}
+			sc->iatu_ur_allocated = true;
 			sc->iatu_ur_offset = 0;
 			sc->iatu_ur_size = rman_get_size(sc->iatu_ur_res);
-		} else if (rv == ENOENT) {
+		} else {
 			sc->iatu_ur_res = sc->dbi_res;
 			sc->iatu_ur_offset = DW_DEFAULT_IATU_UR_DBI_OFFSET;
 			sc->iatu_ur_size = DW_DEFAULT_IATU_UR_DBI_SIZE;
-		} else {
-			device_printf(dev, "Cannot get iATU space memory\n");
-			rv = ENXIO;
-			goto out;
 		}
 	}
 
-	rv = pci_dw_detect_out_atu_regions(sc);
-	if (rv != 0)
-		goto out;
+	if (pci_dw_soc_force_atu_regions(sc, unroll_mode, atu_rid)) {
+		sc->num_out_regions = 8;
+		sc->num_in_regions = 8;
+	} else {
+		rv = pci_dw_detect_out_atu_regions(sc);
+		if (rv != 0)
+			goto out;
+		if (unroll_mode) {
+			rv = pci_dw_detect_in_atu_regions_unroll(sc);
+			if (rv != 0)
+				goto out;
+		}
+	}
 
 	if (bootverbose)
 		device_printf(sc->dev, "Detected outbound iATU regions: %d\n",
 		    sc->num_out_regions);
+	if (unroll_mode)
+		pci_dw_disable_all_atu_unroll(sc);
 
 	rv = pci_dw_setup_hw(sc);
 	if (rv != 0)
 		goto out;
 
-	device_add_child(dev, "pci", -1);
+	if (add_child)
+		device_add_child(dev, "pci", -1);
 
 	return (0);
 out:
-	/* XXX Cleanup */
+	pci_dw_fini_core(dev);
 	return (rv);
+}
+
+int
+pci_dw_init(device_t dev)
+{
+
+	return (pci_dw_init_common(dev, true));
+}
+
+int
+pci_dw_init_core(device_t dev)
+{
+
+	return (pci_dw_init_common(dev, false));
+}
+
+int
+pci_dw_add_child(device_t dev)
+{
+
+	device_add_child(dev, "pci", -1);
+	return (0);
 }
 
 static device_method_t pci_dw_methods[] = {

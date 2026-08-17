@@ -199,6 +199,7 @@ static int mmc_retune(device_t busdev, device_t dev, bool reset);
 static void mmc_scan(struct mmc_softc *sc);
 static int mmc_sd_switch(struct mmc_softc *sc, uint8_t mode, uint8_t grp,
     uint8_t value, uint8_t *res);
+static int mmc_sd_switch_voltage(struct mmc_softc *sc);
 static int mmc_select_card(struct mmc_softc *sc, uint16_t rca);
 static uint32_t mmc_select_vdd(struct mmc_softc *sc, uint32_t ocr);
 static int mmc_send_app_op_cond(struct mmc_softc *sc, uint32_t ocr,
@@ -655,6 +656,80 @@ mmc_send_if_cond(struct mmc_softc *sc, uint8_t vhs)
 	return (err);
 }
 
+static int
+mmc_sd_switch_voltage(struct mmc_softc *sc)
+{
+	device_t dev;
+	uint32_t clock, resp;
+	int busy, err;
+
+	dev = sc->dev;
+	resp = 0;
+	err = mmc_wait_for_command(sc, SD_SWITCH_VOLTAGE, 0,
+	    MMC_RSP_R1 | MMC_CMD_AC, &resp, 0);
+	if (err != MMC_ERR_NONE)
+		goto power_cycle;
+	if ((resp & R1_ERROR) != 0) {
+		err = MMC_ERR_FAILED;
+		goto power_cycle;
+	}
+
+	/* CMD11 requires DAT[3:0] low before, and high after, the switch. */
+	mmc_ms_delay(1);
+	busy = MMCBR_CARD_BUSY(device_get_parent(dev), dev);
+	if (busy != 1) {
+		device_printf(dev,
+		    "CMD11 DAT-low check failed (busy=%d)\n", busy);
+		err = MMC_ERR_FAILED;
+		goto power_cycle;
+	}
+	device_printf(dev, "CMD11 accepted; DAT[3:0] are low\n");
+
+	clock = mmcbr_get_clock(dev);
+	mmcbr_set_clock(dev, 0);
+	if (mmcbr_update_ios(dev) != 0) {
+		err = MMC_ERR_FAILED;
+		goto power_cycle;
+	}
+	mmcbr_set_vccq(dev, vccq_180);
+	if (mmcbr_switch_vccq(dev) != 0) {
+		err = MMC_ERR_FAILED;
+		goto power_cycle;
+	}
+	/* Linux keeps the clock gated for 10 ms (the SD minimum is 5 ms). */
+	mmc_ms_delay(10);
+	mmcbr_set_clock(dev, clock);
+	if (mmcbr_update_ios(dev) != 0) {
+		err = MMC_ERR_FAILED;
+		goto power_cycle;
+	}
+	mmc_ms_delay(1);
+	busy = MMCBR_CARD_BUSY(device_get_parent(dev), dev);
+	if (busy != 0) {
+		device_printf(dev,
+		    "1.8 V DAT-high check failed (busy=%d)\n", busy);
+		err = MMC_ERR_FAILED;
+		goto power_cycle;
+	}
+	device_printf(dev, "1.8 V signal switch complete; DAT[3:0] are high\n");
+	return (MMC_ERR_NONE);
+
+power_cycle:
+	device_printf(dev,
+	    "signal voltage switch failed; power cycling card\n");
+	mmc_power_down(sc);
+	/* SD requires at least 1 ms with card power removed. */
+	mmc_ms_delay(1);
+	mmc_power_up(sc);
+	if (mmcbr_get_vccq(dev) != vccq_330 ||
+	    mmcbr_update_ios(dev) != 0) {
+		device_printf(dev, "failed to restore verified 3.3 V state\n");
+		mmc_power_down(sc);
+		return (MMC_ERR_INVALID);
+	}
+	return (err);
+}
+
 static void
 mmc_power_up(struct mmc_softc *sc)
 {
@@ -904,10 +979,21 @@ mmc_set_timing(struct mmc_softc *sc, struct mmc_ivars *ivar,
 	if (mmcbr_get_mode(sc->dev) == mode_sd) {
 		switch (timing) {
 		case bus_timing_normal:
+		case bus_timing_uhs_sdr12:
 			value = SD_SWITCH_NORMAL_MODE;
 			break;
 		case bus_timing_hs:
+		case bus_timing_uhs_sdr25:
 			value = SD_SWITCH_HS_MODE;
+			break;
+		case bus_timing_uhs_sdr50:
+			value = SD_SWITCH_SDR50_MODE;
+			break;
+		case bus_timing_uhs_sdr104:
+			value = SD_SWITCH_SDR104_MODE;
+			break;
+		case bus_timing_uhs_ddr50:
+			value = SD_SWITCH_DDR50;
 			break;
 		default:
 			return (MMC_ERR_INVALID);
@@ -991,7 +1077,7 @@ mmc_test_bus_width(struct mmc_softc *sc)
 	struct mmc_command cmd;
 	struct mmc_data data;
 	uint8_t buf[8];
-	int err;
+	int read_err;
 
 	if (mmcbr_get_caps(sc->dev) & MMC_CAP_8_BIT_DATA) {
 		mmcbr_set_bus_width(sc->dev, bus_width_8);
@@ -1012,6 +1098,7 @@ mmc_test_bus_width(struct mmc_softc *sc)
 
 		memset(&cmd, 0, sizeof(cmd));
 		memset(&data, 0, sizeof(data));
+		memset(buf, 0xee, sizeof(buf));
 		cmd.opcode = MMC_BUSTEST_R;
 		cmd.arg = 0;
 		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
@@ -1020,13 +1107,13 @@ mmc_test_bus_width(struct mmc_softc *sc)
 		data.data = buf;
 		data.len = 8;
 		data.flags = MMC_DATA_READ;
-		err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
+		read_err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
 		sc->squelched--;
 
 		mmcbr_set_bus_width(sc->dev, bus_width_1);
 		mmcbr_update_ios(sc->dev);
 
-		if (err == MMC_ERR_NONE && memcmp(buf, p8ok, 8) == 0)
+		if (read_err == MMC_ERR_NONE && memcmp(buf, p8ok, 8) == 0)
 			return (bus_width_8);
 	}
 
@@ -1049,6 +1136,7 @@ mmc_test_bus_width(struct mmc_softc *sc)
 
 		memset(&cmd, 0, sizeof(cmd));
 		memset(&data, 0, sizeof(data));
+		memset(buf, 0xee, sizeof(buf));
 		cmd.opcode = MMC_BUSTEST_R;
 		cmd.arg = 0;
 		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
@@ -1057,13 +1145,13 @@ mmc_test_bus_width(struct mmc_softc *sc)
 		data.data = buf;
 		data.len = 4;
 		data.flags = MMC_DATA_READ;
-		err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
+		read_err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
 		sc->squelched--;
 
 		mmcbr_set_bus_width(sc->dev, bus_width_1);
 		mmcbr_update_ios(sc->dev);
 
-		if (err == MMC_ERR_NONE && memcmp(buf, p4ok, 4) == 0)
+		if (read_err == MMC_ERR_NONE && memcmp(buf, p4ok, 4) == 0)
 			return (bus_width_4);
 	}
 	return (bus_width_1);
@@ -1547,8 +1635,9 @@ mmc_host_timing(device_t dev, enum mmc_bus_timing timing)
 		return (HOST_TIMING_CAP(host_caps, MMC_CAP_MMC_HS400_120) ||
 			HOST_TIMING_CAP(host_caps, MMC_CAP_MMC_HS400_180));
 	case bus_timing_mmc_hs400es:
-		return (HOST_TIMING_CAP(host_caps, MMC_CAP_MMC_HS400 |
-		    MMC_CAP_MMC_ENH_STROBE));
+		return ((HOST_TIMING_CAP(host_caps, MMC_CAP_MMC_HS400_120) ||
+		    HOST_TIMING_CAP(host_caps, MMC_CAP_MMC_HS400_180)) &&
+		    HOST_TIMING_CAP(host_caps, MMC_CAP_MMC_ENH_STROBE));
 	}
 
 #undef HOST_TIMING_CAP
@@ -1700,10 +1789,49 @@ mmc_discover_cards(struct mmc_softc *sc)
 				err = mmc_sd_switch(sc, SD_SWITCH_MODE_CHECK,
 				    SD_SWITCH_GROUP1, SD_SWITCH_NOCHANGE,
 				    switch_res);
-				if (err == MMC_ERR_NONE &&
-				    switch_res[13] & (1 << SD_SWITCH_HS_MODE)) {
-					setbit(&ivar->timings, bus_timing_hs);
-					ivar->hs_tran_speed = SD_HS_MAX;
+				if (err == MMC_ERR_NONE) {
+					if (mmcbr_get_vccq(sc->dev) == vccq_180) {
+						if ((switch_res[13] & (1 <<
+						    SD_SWITCH_NORMAL_MODE)) != 0) {
+							setbit(&ivar->timings,
+							    bus_timing_uhs_sdr12);
+							setbit(&ivar->vccq_180,
+							    bus_timing_uhs_sdr12);
+						}
+						if ((switch_res[13] & (1 <<
+						    SD_SWITCH_HS_MODE)) != 0) {
+							setbit(&ivar->timings,
+							    bus_timing_uhs_sdr25);
+							setbit(&ivar->vccq_180,
+							    bus_timing_uhs_sdr25);
+						}
+						if ((switch_res[13] & (1 <<
+						    SD_SWITCH_SDR50_MODE)) != 0) {
+							setbit(&ivar->timings,
+							    bus_timing_uhs_sdr50);
+							setbit(&ivar->vccq_180,
+							    bus_timing_uhs_sdr50);
+						}
+						if ((switch_res[13] & (1 <<
+						    SD_SWITCH_SDR104_MODE)) != 0) {
+							setbit(&ivar->timings,
+							    bus_timing_uhs_sdr104);
+							setbit(&ivar->vccq_180,
+							    bus_timing_uhs_sdr104);
+						}
+						if ((switch_res[13] & (1 <<
+						    SD_SWITCH_DDR50)) != 0) {
+							setbit(&ivar->timings,
+							    bus_timing_uhs_ddr50);
+							setbit(&ivar->vccq_180,
+							    bus_timing_uhs_ddr50);
+						}
+					} else if ((switch_res[13] & (1 <<
+					    SD_SWITCH_HS_MODE)) != 0) {
+						setbit(&ivar->timings,
+						    bus_timing_hs);
+						ivar->hs_tran_speed = SD_HS_MAX;
+					}
 				}
 			}
 
@@ -2027,9 +2155,10 @@ mmc_delete_cards(struct mmc_softc *sc, bool final)
 static void
 mmc_go_discovery(struct mmc_softc *sc)
 {
-	uint32_t ocr;
+	uint32_t arg, ocr, rocr;
 	device_t dev;
-	int err;
+	int busy, caps, err;
+	bool request_s18;
 
 	dev = sc->dev;
 	if (mmcbr_get_power_mode(dev) != power_on) {
@@ -2094,8 +2223,41 @@ mmc_go_discovery(struct mmc_softc *sc)
 	 */
 	if (mmcbr_get_mode(dev) == mode_sd) {
 		err = mmc_send_if_cond(sc, 1);
-		mmc_send_app_op_cond(sc,
-		    (err ? 0 : MMC_OCR_CCS) | mmcbr_get_ocr(dev), NULL);
+		arg = (err ? 0 : MMC_OCR_CCS) | mmcbr_get_ocr(dev);
+		caps = mmcbr_get_caps(dev);
+		busy = MMCBR_CARD_BUSY(device_get_parent(dev), dev);
+		request_s18 = err == MMC_ERR_NONE && busy == 0 &&
+		    (caps & MMC_CAP_SIGNALING_180) != 0 &&
+		    (caps & (MMC_CAP_UHS_SDR12 | MMC_CAP_UHS_SDR25)) != 0;
+		if (request_s18)
+			arg |= MMC_OCR_S18R;
+		rocr = 0;
+		err = mmc_send_app_op_cond(sc, arg, &rocr);
+		if (err != MMC_ERR_NONE)
+			goto init_failed;
+		if (request_s18 && (rocr & MMC_OCR_S18A) != 0) {
+			device_printf(dev,
+			    "card accepted S18R (OCR=%#x); issuing CMD11\n",
+			    rocr);
+			err = mmc_sd_switch_voltage(sc);
+			if (err != MMC_ERR_NONE) {
+				if (mmcbr_get_power_mode(dev) != power_on)
+					goto init_failed;
+				device_printf(dev,
+				    "retrying SD initialization at 3.3 V\n");
+				mmcbr_set_bus_mode(dev, pushpull);
+				mmc_idle_cards(sc);
+				err = mmc_send_if_cond(sc, 1);
+				arg = (err ? 0 : MMC_OCR_CCS) |
+				    mmcbr_get_ocr(dev);
+				err = mmc_send_app_op_cond(sc, arg, &rocr);
+				if (err != MMC_ERR_NONE)
+					goto init_failed;
+			}
+		} else if (request_s18 && (bootverbose || mmc_debug)) {
+			device_printf(dev,
+			    "card declined 1.8 V signaling (OCR=%#x)\n", rocr);
+		}
 	} else
 		mmc_send_op_cond(sc, MMC_OCR_CCS | mmcbr_get_ocr(dev), NULL);
 	mmc_discover_cards(sc);
@@ -2103,7 +2265,15 @@ mmc_go_discovery(struct mmc_softc *sc)
 
 	mmcbr_set_bus_mode(dev, pushpull);
 	mmcbr_update_ios(dev);
-	mmc_calculate_clock(sc);
+	if (mmc_calculate_clock(sc) == 0)
+		goto init_failed;
+	return;
+
+init_failed:
+	device_printf(dev, "Card initialization failed; powering card off\n");
+	mmcbr_set_ocr(dev, 0);
+	(void)mmc_delete_cards(sc, false);
+	mmc_power_down(sc);
 }
 
 static int
@@ -2171,6 +2341,18 @@ mmc_calculate_clock(struct mmc_softc *sc)
 			device_printf(dev, "Card at relative address %d "
 			    "failed to select\n", rca);
 			continue;
+		}
+
+		if (mmcbr_get_mode(dev) == mode_sd &&
+		    mmcbr_get_bus_width(dev) != ivar->bus_width) {
+			if (mmc_set_card_bus_width(sc, ivar, timing) !=
+			    MMC_ERR_NONE) {
+				device_printf(dev, "Card at relative address "
+				    "%d failed to set bus width\n", rca);
+				continue;
+			}
+			mmcbr_set_bus_width(dev, ivar->bus_width);
+			mmcbr_update_ios(dev);
 		}
 
 		if (timing == bus_timing_mmc_hs200 ||	/* includes HS400 */
@@ -2241,13 +2423,15 @@ clock:
 		 * layer to actually execute tuning otherwise.
 		 */
 		if (timing <= bus_timing_uhs_sdr25 ||
+		    timing == bus_timing_uhs_ddr50 ||
 		    timing == bus_timing_mmc_ddr52)
 			goto power_class;
 
 		if (mmcbr_tune(dev, hs400) != 0) {
 			device_printf(dev, "Card at relative address %d "
 			    "failed to execute initial tuning\n", rca);
-			continue;
+			(void)mmc_select_card(sc, 0);
+			return (0);
 		}
 
 		if (hs400 == true && mmc_switch_to_hs400(sc, ivar, max_dtr,

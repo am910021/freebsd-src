@@ -1080,7 +1080,7 @@ usbd_transfer_setup(struct usb_device *udev,
 			usb_dma_tag_setup(&info->dma_parent_tag,
 			    parm->dma_tag_p, udev->bus->dma_parent_tag[0].tag,
 			    xfer_mtx, &usb_bdma_done_event, udev->bus->dma_bits,
-			    parm->dma_tag_max);
+			    parm->dma_tag_max, udev->bus->dma_xfer_alloc_mode);
 #endif
 
 			info->bus = udev->bus;
@@ -1889,8 +1889,10 @@ usbd_transfer_submit(struct usb_xfer *xfer)
 	 */
 #if USB_HAVE_BUSDMA
 	if (xfer->flags_int.bdma_enable) {
+		USB_BUS_LOCK(bus);
 		/* insert the USB transfer last in the BUS-DMA queue */
 		usb_command_wrapper(&xfer->xroot->dma_q, xfer);
+		USB_BUS_UNLOCK(bus);
 		return;
 	}
 #endif

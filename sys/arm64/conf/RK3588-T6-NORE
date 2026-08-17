@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2026 Fang, Wei-Xiang (Yuri) <am910021@gmail.com>
+
+include		GENERIC
+ident		RK3588_T6_NORE
+
+# RK3588-DIAG V2305: resolve V0PLL/NPLL through read-only hardware providers.
+# Print the bring-up version immediately after
+# ---<<BOOT>>--- so console-only hangs can be tied to the exact kernel.
+options		BOOT_TAG_SZ=128
+options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2391-early-boot-marker\"
+
+# Performance profile: assumes copyin/copyout endpoints are Normal memory.
+# Remove this option to retain stock byte copies for 4-byte alignment.
+options		ARM64_COPYIO_ALIGNED_WORD_PAIR
+
+# Keep an alternate mapped RX slot available while the network stack owns
+# the preceding mlx5 buffer.
+options		MLX5E_RX_MAPPED_SLOTS
+
+# RK3588-DIAG V106: keep bring-up kernels debuggable even when crash
+# dumps are disabled on the target rootfs.
+makeoptions	DEBUG=-g
+
+# RK3588-DIAG: keep unrelated x86/laptop Wi-Fi modules out of RK3588
+# bring-up builds.  These modules have repeatedly failed the arm64
+# cross-build before the RK3588 kernel itself finished.
+makeoptions	WITHOUT_MODULES="iwlwifi rtw89"
+
+options		KDB
+options		KDB_TRACE
+options		DDB
+
+# RK3588-DIAG V094: use the Armbian/LTS DTB iommu-map entries for PCIe DMA.
+# RK3588 PCIe endpoints are behind mmu600_pcie in the board DTB.
+options		IOMMU
+
+# RK3588-DIAG V251: enable FreeBSD RSS paths for high-throughput PCIe NICs.
+# mlx5en has RSS-aware RX/hash and interrupt paths guarded by #ifdef RSS.
+options		RSS
+
+# Use the common PL330/xDMA framework instead of the RK3588 read-only monitor.
+device		xdma
+device		pl330
+
+# Use the in-tree DRM2 core for the initial RK3588 KMS implementation.
+device		drm2
+
+# The NanoPC-T6 LTS onboard RTL8125 NICs use the external community if_rge
+# module.  Keep base re(4) out so driver ownership remains explicit.
+nodevice	re

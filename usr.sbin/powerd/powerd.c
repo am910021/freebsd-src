@@ -85,6 +85,7 @@ static const char *modes[] = {
 #define DEVCTL_MAXBUF	1024
 
 static int	read_usage_times(int *load, int nonice);
+static int	init_freq_controls(void);
 static int	read_freqs(int *numfreqs, int **freqs, int **power,
 		    int minfreq, int maxfreq);
 static int	set_freq(int freq);
@@ -100,6 +101,8 @@ static void	usage(void);
 static int	cp_times_mib[2];
 static int	freq_mib[4];
 static int	levels_mib[4];
+static int	(*freq_controls)[4];
+static int	freq_control_count;
 static int	acline_mib[4];
 static size_t	acline_mib_len;
 
@@ -128,6 +131,56 @@ static int	devd_pipe = -1;
 
 #define DEVD_RETRY_INTERVAL 60 /* seconds */
 static struct timeval tried_devd;
+
+static int
+init_freq_controls(void)
+{
+	char name[64], *levels;
+	size_t len, miblen;
+	int cpu, max_mhz, ncpu, policy_max;
+
+	len = sizeof(ncpu);
+	if (sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) != 0 || ncpu <= 0)
+		return (-1);
+	freq_controls = calloc(ncpu, sizeof(*freq_controls));
+	if (freq_controls == NULL)
+		return (-1);
+
+	policy_max = 0;
+	for (cpu = 0; cpu < ncpu; cpu++) {
+		snprintf(name, sizeof(name), "dev.cpu.%d.freq", cpu);
+		miblen = nitems(freq_controls[freq_control_count]);
+		if (sysctlnametomib(name, freq_controls[freq_control_count],
+		    &miblen) != 0)
+			continue;
+
+		snprintf(name, sizeof(name), "dev.cpu.%d.freq_levels", cpu);
+		len = 0;
+		if (sysctlbyname(name, NULL, &len, NULL, 0) != 0)
+			continue;
+		levels = malloc(len);
+		if (levels == NULL)
+			return (-1);
+		if (sysctlbyname(name, levels, &len, NULL, 0) != 0 ||
+		    sscanf(levels, "%d/", &max_mhz) != 1) {
+			free(levels);
+			continue;
+		}
+		free(levels);
+
+		if (max_mhz > policy_max) {
+			memcpy(freq_mib, freq_controls[freq_control_count],
+			    sizeof(freq_mib));
+			miblen = nitems(levels_mib);
+			if (sysctlnametomib(name, levels_mib, &miblen) != 0)
+				return (-1);
+			policy_max = max_mhz;
+		}
+		freq_control_count++;
+	}
+
+	return (freq_control_count == 0 ? -1 : 0);
+}
 
 /*
  * This function returns summary load of all CPUs.  It was made so
@@ -265,13 +318,16 @@ get_freq(void)
 static int
 set_freq(int freq)
 {
+	int error, i;
 
-	if (sysctl(freq_mib, 4, NULL, NULL, &freq, sizeof(freq))) {
-		if (errno != EPERM)
-			return (-1);
+	error = 0;
+	for (i = 0; i < freq_control_count; i++) {
+		if (sysctl(freq_controls[i], nitems(freq_controls[i]), NULL, NULL,
+		    &freq, sizeof(freq)) != 0 && errno != EPERM)
+			error = -1;
 	}
 
-	return (0);
+	return (error);
 }
 
 static int
@@ -585,12 +641,8 @@ main(int argc, char * argv[])
 	len = 2;
 	if (sysctlnametomib("kern.cp_times", cp_times_mib, &len))
 		err(1, "lookup kern.cp_times");
-	len = 4;
-	if (sysctlnametomib("dev.cpu.0.freq", freq_mib, &len))
+	if (init_freq_controls() != 0)
 		err(EX_UNAVAILABLE, "no cpufreq(4) support -- aborting");
-	len = 4;
-	if (sysctlnametomib("dev.cpu.0.freq_levels", levels_mib, &len))
-		err(1, "lookup freq_levels");
 
 	/* Check if we can read the load and supported freqs. */
 	if (read_usage_times(NULL, nonice))

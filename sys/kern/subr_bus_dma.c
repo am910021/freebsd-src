@@ -235,10 +235,35 @@ _bus_dmamap_load_mbuf_sg(bus_dma_tag_t dmat, bus_dmamap_t map,
     struct mbuf *m0, bus_dma_segment_t *segs, int *nsegs, int flags)
 {
 	struct mbuf *m;
-	int error;
+	vm_page_t ma[16], page;
+	vm_paddr_t paddr;
+	int error, npages;
+	bool page_added;
 
 	error = 0;
+	npages = 0;
 	for (m = m0; m != NULL && error == 0; m = m->m_next) {
+		page_added = false;
+		if ((m->m_flags & M_EXTPG) == 0 && m->m_len == PAGE_SIZE &&
+		    ((vm_offset_t)m->m_data & PAGE_MASK) == 0) {
+			paddr = pmap_kextract((vm_offset_t)m->m_data);
+			page = PHYS_TO_VM_PAGE(paddr);
+			if (page != NULL && VM_PAGE_TO_PHYS(page) == paddr) {
+				ma[npages++] = page;
+				page_added = true;
+			}
+		}
+		if (npages != 0 &&
+		    (!page_added || npages == nitems(ma))) {
+			error = _bus_dmamap_load_ma(dmat, map, ma,
+			    npages * PAGE_SIZE, 0, flags | BUS_DMA_LOAD_MBUF,
+			    segs, nsegs);
+			npages = 0;
+		}
+		if (error != 0)
+			break;
+		if (page_added)
+			continue;
 		if (m->m_len > 0) {
 			if ((m->m_flags & M_EXTPG) != 0)
 				error = _bus_dmamap_load_mbuf_epg(dmat,
@@ -249,6 +274,10 @@ _bus_dmamap_load_mbuf_sg(bus_dma_tag_t dmat, bus_dmamap_t map,
 				    flags | BUS_DMA_LOAD_MBUF, segs, nsegs);
 		}
 	}
+	if (error == 0 && npages != 0)
+		error = _bus_dmamap_load_ma(dmat, map, ma,
+		    npages * PAGE_SIZE, 0, flags | BUS_DMA_LOAD_MBUF, segs,
+		    nsegs);
 	CTR5(KTR_BUSDMA, "%s: tag %p tag flags 0x%x error %d nsegs %d",
 	    __func__, dmat, flags, error, *nsegs);
 	return (error);

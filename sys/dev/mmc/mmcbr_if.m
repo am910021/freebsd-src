@@ -73,6 +73,13 @@ CODE {
 	}
 
 	static int
+	null_card_busy(device_t brdev __unused, device_t reqdev __unused)
+	{
+
+		return (-1);
+	}
+
+	static int
 	null_retune(device_t brdev __unused, device_t reqdev __unused,
 	    bool reset __unused)
 	{
@@ -106,6 +113,15 @@ METHOD int switch_vccq {
 	device_t	brdev;
 	device_t	reqdev;
 } DEFAULT null_switch_vccq;
+
+#
+# Return 1 when DAT[3:0] are low, 0 when they are high, or -1 when the
+# bridge cannot observe them.
+#
+METHOD int card_busy {
+	device_t	brdev;
+	device_t	reqdev;
+} DEFAULT null_card_busy;
 
 #
 # Called by the mmcbus with the bridge claimed to execute initial tuning.

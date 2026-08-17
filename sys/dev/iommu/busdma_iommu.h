@@ -39,6 +39,7 @@ struct bus_dma_tag_iommu {
 	struct iommu_ctx *ctx;
 	device_t owner;
 	int map_count;
+	bool dma_policy_owner;
 	bus_dma_segment_t *segments;
 };
 
@@ -49,9 +50,13 @@ struct bus_dmamap_iommu {
 	void *callback_arg;
 	struct mtx lock;
 	struct iommu_map_entries_tailq map_entries;
+	bus_dma_segment_t *sync_segs;
 	TAILQ_ENTRY(bus_dmamap_iommu) delay_link;
+	int sync_count;
+	int sync_maxsegs;
 	bool locked;
 	bool cansleep;
+	bool sync_overflow;
 	int flags;
 #ifdef KMSAN
 	struct memdesc kmsan_mem;
@@ -66,6 +71,8 @@ struct bus_dmamap_iommu {
 
 #define	BUS_DMAMAP_IOMMU_MALLOC	0x0001
 #define	BUS_DMAMAP_IOMMU_KMEM_ALLOC 0x0002
+#define	BUS_DMAMAP_IOMMU_RETAINED 0x0004
+#define	BUS_DMAMAP_IOMMU_COHERENT 0x0008
 
 extern struct bus_dma_impl bus_dma_iommu_impl;
 

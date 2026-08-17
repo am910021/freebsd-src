@@ -75,6 +75,7 @@ struct cpufreq_dt_softc {
 	device_t dev;
 	clk_t clk;
 	regulator_t reg;
+	bool has_regulator;
 
 	struct cpufreq_dt_opp *opp;
 	ssize_t nopp;
@@ -82,6 +83,29 @@ struct cpufreq_dt_softc {
 	int cpu;
 	cpuset_t cpus;
 };
+
+static int
+cpufreq_dt_get_regulator(struct cpufreq_dt_softc *sc)
+{
+	phandle_t node;
+	int error;
+
+	if (CPUFREQ_DT_HAVE_REGULATOR(sc))
+		return (0);
+
+	node = ofw_bus_get_node(device_get_parent(sc->dev));
+	error = regulator_get_by_ofw_property(sc->dev, node, "cpu-supply",
+	    &sc->reg);
+	if (error == 0) {
+		device_printf(sc->dev, "Found cpu-supply\n");
+		return (0);
+	}
+	error = regulator_get_by_ofw_property(sc->dev, node, "cpu0-supply",
+	    &sc->reg);
+	if (error == 0)
+		device_printf(sc->dev, "Found cpu0-supply\n");
+	return (error);
+}
 
 static void
 cpufreq_dt_notify(device_t dev, uint64_t freq)
@@ -181,9 +205,18 @@ cpufreq_dt_set(device_t dev, const struct cf_setting *set)
 		return (0);
 	}
 
+	if (sc->has_regulator && !CPUFREQ_DT_HAVE_REGULATOR(sc) &&
+	    cpufreq_dt_get_regulator(sc) != 0)
+		return (ENXIO);
+
 	if (clk_get_freq(sc->clk, &freq) != 0) {
 		device_printf(dev, "Can't get current clk freq\n");
 		return (ENXIO);
+	}
+	copp = cpufreq_dt_find_opp(sc->dev, freq);
+	if (copp == NULL) {
+		device_printf(dev, "Can't find the current freq in opp\n");
+		return (ENOENT);
 	}
 
 	/*
@@ -200,18 +233,12 @@ cpufreq_dt_set(device_t dev, const struct cf_setting *set)
 			 * granularity can be different that granularity of
 			 * oppoint table.
 			 */
-			copp = cpufreq_dt_find_opp(sc->dev, freq);
-			if (copp == NULL) {
-				device_printf(dev,
-				    "Can't find the current freq in opp\n");
-				return (ENOENT);
-			}
 			uvolt = copp->uvolt_target;
 		}
 	} else
 		uvolt = 0;
 
-	opp = cpufreq_dt_find_opp(sc->dev, set->freq * 1000000);
+	opp = cpufreq_dt_find_opp(sc->dev, (uint64_t)set->freq * 1000000);
 	if (opp == NULL) {
 		device_printf(dev, "Couldn't find an opp for this freq\n");
 		return (EINVAL);
@@ -271,7 +298,8 @@ cpufreq_dt_type(device_t dev, int *type)
 	if (type == NULL)
 		return (EINVAL);
 
-	*type = CPUFREQ_TYPE_ABSOLUTE;
+	*type = CPUFREQ_TYPE_ABSOLUTE | CPUFREQ_FLAG_UNCACHED |
+	    CPUFREQ_FLAG_PER_DOMAIN;
 	return (0);
 }
 
@@ -434,7 +462,7 @@ cpufreq_dt_oppv2_parse(struct cpufreq_dt_softc *sc, phandle_t node)
 		if (OF_hasprop(opp_table, "opp-suspend"))
 			sc->opp[i].opp_suspend = true;
 
-		if (CPUFREQ_DT_HAVE_REGULATOR(sc)) {
+		if (sc->has_regulator) {
 			nvolt = OF_getencprop_alloc_multi(opp_table,
 			    "opp-microvolt", sizeof(*volts), (void **)&volts);
 			if (nvolt == 1) {
@@ -486,6 +514,8 @@ cpufreq_dt_attach(device_t dev)
 	node = ofw_bus_get_node(device_get_parent(dev));
 	sc->cpu = device_get_unit(device_get_parent(dev));
 	sc->reg = NULL;
+	sc->has_regulator = OF_hasprop(node, "cpu-supply") ||
+	    OF_hasprop(node, "cpu0-supply");
 
 	DPRINTF(dev, "cpu=%d\n", sc->cpu);
 	if (sc->cpu >= mp_ncpus) {
@@ -499,12 +529,7 @@ cpufreq_dt_attach(device_t dev)
 	 * quite yet.  If it's operating-points-v2 then regulator
 	 * and voltage entries are optional.
 	 */
-	if (regulator_get_by_ofw_property(dev, node, "cpu-supply",
-	    &sc->reg) == 0)
-		device_printf(dev, "Found cpu-supply\n");
-	else if (regulator_get_by_ofw_property(dev, node, "cpu0-supply",
-	    &sc->reg) == 0)
-		device_printf(dev, "Found cpu0-supply\n");
+	(void)cpufreq_dt_get_regulator(sc);
 
 	/*
 	 * Determine which operating mode we're in.  Error out if we expect
@@ -524,7 +549,7 @@ cpufreq_dt_attach(device_t dev)
 	/*
 	 * Now, we only enforce needing a regulator for v1.
 	 */
-	if ((version == OPP_V1) && !CPUFREQ_DT_HAVE_REGULATOR(sc)) {
+	if ((version == OPP_V1) && !sc->has_regulator) {
 		device_printf(dev, "no regulator for %s\n",
 		    ofw_bus_get_name(device_get_parent(dev)));
 		rv = ENXIO;

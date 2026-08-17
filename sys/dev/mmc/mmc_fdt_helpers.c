@@ -278,7 +278,7 @@ mmc_fdt_gpio_setup(device_t dev, phandle_t node, struct mmc_helper *helper,
 	cd_setup(helper, node);
 	wp_setup(helper, node);
 
-	/* 
+	/*
 	 * Schedule a card detection
 	 */
 	taskqueue_enqueue_timeout_sbt(taskqueue_bus,
@@ -336,42 +336,71 @@ mmc_fdt_gpio_get_readonly(struct mmc_helper *helper)
 	return (pinstate ^ (bool)(helper->props & MMC_PROP_WP_INVERTED));
 }
 
-void
+int
 mmc_fdt_set_power(struct mmc_helper *helper, enum mmc_power_mode power_mode)
 {
+	int error;
 	int reg_status;
 	int rv;
 
+	error = 0;
 	switch (power_mode) {
 	case power_on:
 		break;
 	case power_off:
 		if (helper->vmmc_supply) {
 			rv = regulator_status(helper->vmmc_supply, &reg_status);
-			if (rv == 0 && reg_status == REGULATOR_STATUS_ENABLED)
-				regulator_disable(helper->vmmc_supply);
+			if (rv == 0 && reg_status == REGULATOR_STATUS_ENABLED) {
+				rv = regulator_disable(helper->vmmc_supply);
+				if (error == 0)
+					error = rv;
+			} else if (error == 0) {
+				error = rv;
+			}
 		}
 		if (helper->vqmmc_supply) {
 			rv = regulator_status(helper->vqmmc_supply, &reg_status);
-			if (rv == 0 && reg_status == REGULATOR_STATUS_ENABLED)
-				regulator_disable(helper->vqmmc_supply);
+			if (rv == 0 && reg_status == REGULATOR_STATUS_ENABLED) {
+				rv = regulator_disable(helper->vqmmc_supply);
+				if (error == 0)
+					error = rv;
+			} else if (error == 0) {
+				error = rv;
+			}
 		}
-		if (helper->mmc_pwrseq)
-			MMC_PWRSEQ_SET_POWER(helper->mmc_pwrseq, false);
+		if (helper->mmc_pwrseq) {
+			rv = MMC_PWRSEQ_SET_POWER(helper->mmc_pwrseq, false);
+			if (error == 0)
+				error = rv;
+		}
 		break;
 	case power_up:
 		if (helper->vmmc_supply) {
 			rv = regulator_status(helper->vmmc_supply, &reg_status);
-			if (rv == 0 && reg_status != REGULATOR_STATUS_ENABLED)
-				regulator_enable(helper->vmmc_supply);
+			if (rv == 0 && reg_status != REGULATOR_STATUS_ENABLED) {
+				rv = regulator_enable(helper->vmmc_supply);
+				if (error == 0)
+					error = rv;
+			} else if (error == 0) {
+				error = rv;
+			}
 		}
 		if (helper->vqmmc_supply) {
 			rv = regulator_status(helper->vqmmc_supply, &reg_status);
-			if (rv == 0 && reg_status != REGULATOR_STATUS_ENABLED)
-				regulator_enable(helper->vqmmc_supply);
+			if (rv == 0 && reg_status != REGULATOR_STATUS_ENABLED) {
+				rv = regulator_enable(helper->vqmmc_supply);
+				if (error == 0)
+					error = rv;
+			} else if (error == 0) {
+				error = rv;
+			}
 		}
-		if (helper->mmc_pwrseq)
-			MMC_PWRSEQ_SET_POWER(helper->mmc_pwrseq, true);
+		if (helper->mmc_pwrseq) {
+			rv = MMC_PWRSEQ_SET_POWER(helper->mmc_pwrseq, true);
+			if (error == 0)
+				error = rv;
+		}
 		break;
 	}
+	return (error);
 }

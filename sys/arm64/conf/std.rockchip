@@ -6,6 +6,7 @@
 options 	SOC_ROCKCHIP_RK3328
 options 	SOC_ROCKCHIP_RK3399
 options 	SOC_ROCKCHIP_RK3568
+options 	SOC_ROCKCHIP_RK3588
 
 # GPIO / PINCTRL
 device		dwgpio			# Synopsys DesignWare APB GPIO Controller
@@ -41,8 +42,16 @@ device		eqos			# Synopsys Designware Ethernet QoS controller
 # IO Domains
 device		rk_iodomain
 
+# HDMI support
+device		videomode		# EDID and video timing parser
+device		rk3588_hdmi_qp		# RK3588 DesignWare HDMI QP prerequisites
+device		rk3588_hdptx_phy	# RK3588 Samsung HDMI HDPTX PHY
+device		rk3588_vop2		# RK3588 VOP2 display controller
+
 # USB support
 device		rk_usb2phy		# Rockchip USB2PHY
+device		fusb302			# FUSB302 Type-C source controller
+device		rk_usbdp_phy		# Rockchip RK3588 USBDP PHY
 device		rk_typec_phy		# Rockchip TypeC PHY
 device		dwc3			# Synopsys DWC controller
 device		rk_dwc3			# Rockchip DWC3 controller

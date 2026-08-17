@@ -204,6 +204,9 @@ static const struct fxrng_ent_char {
 	[RANDOM_PURE_VMGENID] = {
 		.entc_cls = &fxrng_hi_push,
 	},
+	[RANDOM_PURE_ROCKCHIP] = {
+		.entc_cls = &fxrng_hi_pull,
+	},
 };
 
 /* Useful for single-bit-per-source state. */

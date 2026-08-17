@@ -525,6 +525,7 @@ usb_pc_alloc_mem(struct usb_page_cache *pc, struct usb_page *pg,
 	struct usb_dma_tag *utag;
 	bus_dmamap_t map;
 	void *ptr;
+	int dma_flags;
 	int err;
 
 	uptag = pc->tag_parent;
@@ -568,9 +569,13 @@ usb_pc_alloc_mem(struct usb_page_cache *pc, struct usb_page *pg,
 	if (utag == NULL) {
 		goto error;
 	}
+	dma_flags = BUS_DMA_WAITOK;
+	if (uptag->alloc_mode == USB_DMA_ALLOC_COHERENT ||
+	    (uptag->alloc_mode == USB_DMA_ALLOC_STREAMING_PAYLOAD &&
+	     align != 1))
+		dma_flags |= BUS_DMA_COHERENT;
 	/* allocate memory */
-	if (bus_dmamem_alloc(
-	    utag->tag, &ptr, (BUS_DMA_WAITOK | BUS_DMA_COHERENT), &map)) {
+	if (bus_dmamem_alloc(utag->tag, &ptr, dma_flags, &map)) {
 		goto error;
 	}
 	/* setup page cache */
@@ -585,9 +590,8 @@ usb_pc_alloc_mem(struct usb_page_cache *pc, struct usb_page *pg,
 	USB_MTX_LOCK(uptag->mtx);
 
 	/* load memory into DMA */
-	err = bus_dmamap_load(
-	    utag->tag, map, ptr, size, &usb_pc_alloc_mem_cb,
-	    pc, (BUS_DMA_WAITOK | BUS_DMA_COHERENT));
+	err = bus_dmamap_load(utag->tag, map, ptr, size,
+	    &usb_pc_alloc_mem_cb, pc, dma_flags);
 
 	if (err == EINPROGRESS) {
 		cv_wait(uptag->cv, uptag->mtx);
@@ -841,7 +845,7 @@ void
 usb_dma_tag_setup(struct usb_dma_parent_tag *udpt,
     struct usb_dma_tag *udt, bus_dma_tag_t dmat,
     struct mtx *mtx, usb_dma_callback_t *func,
-    uint8_t ndmabits, uint8_t nudt)
+    uint8_t ndmabits, uint8_t nudt, uint8_t alloc_mode)
 {
 	memset(udpt, 0, sizeof(*udpt));
 
@@ -862,6 +866,7 @@ usb_dma_tag_setup(struct usb_dma_parent_tag *udpt,
 	udpt->utag_first = udt;
 	udpt->utag_max = nudt;
 	udpt->dma_bits = ndmabits;
+	udpt->alloc_mode = alloc_mode;
 
 	while (nudt--) {
 		memset(udt, 0, sizeof(*udt));

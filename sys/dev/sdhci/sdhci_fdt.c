@@ -53,12 +53,14 @@
 #include <dev/ofw/ofw_subr.h>
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/clk/clk_fixed.h>
+#include <dev/extres/hwreset/hwreset.h>
 #include <dev/extres/syscon/syscon.h>
 #include <dev/extres/phy/phy.h>
 
 #include <dev/mmc/bridge.h>
 
 #include <dev/sdhci/sdhci.h>
+#include <dev/sdhci/sdhci_fdt_soc.h>
 
 #include "mmcbr_if.h"
 #include "sdhci_if.h"
@@ -143,6 +145,7 @@ struct sdhci_fdt_softc {
 	clk_t		clk_xin;	/* xin24m fixed clock */
 	clk_t		clk_ahb;	/* ahb clock */
 	clk_t		clk_core;	/* core clock */
+	hwreset_array_t resets;		/* optional controller resets */
 	phy_t		phy;		/* phy to be used */
 
 	struct syscon	*syscon;	/* Handle to the syscon */
@@ -372,8 +375,25 @@ sdhci_fdt_read_2(device_t dev, struct sdhci_slot *slot, bus_size_t off)
 	return (bus_read_2(sc->mem_res[slot->num], off));
 }
 
+uint16_t
+sdhci_fdt_slot_read_2(device_t dev, struct sdhci_slot *slot, bus_size_t off)
+{
+	struct sdhci_fdt_softc *sc = device_get_softc(dev);
+
+	return (bus_read_2(sc->mem_res[slot->num], off));
+}
+
 static void
 sdhci_fdt_write_2(device_t dev, struct sdhci_slot *slot, bus_size_t off,
+    uint16_t val)
+{
+	struct sdhci_fdt_softc *sc = device_get_softc(dev);
+
+	bus_write_2(sc->mem_res[slot->num], off, val);
+}
+
+void
+sdhci_fdt_slot_write_2(device_t dev, struct sdhci_slot *slot, bus_size_t off,
     uint16_t val)
 {
 	struct sdhci_fdt_softc *sc = device_get_softc(dev);
@@ -390,8 +410,22 @@ sdhci_fdt_read_4(device_t dev, struct sdhci_slot *slot, bus_size_t off)
 	val32 = bus_read_4(sc->mem_res[slot->num], off);
 	if (off == SDHCI_CAPABILITIES && sc->no_18v)
 		val32 &= ~SDHCI_CAN_VDD_180;
+	if (off == SDHCI_CAPABILITIES2 &&
+	    !sdhci_fdt_soc_enable_high_speed_caps(dev))
+		val32 &= ~(SDHCI_CAN_SDR50 | SDHCI_CAN_SDR104 |
+		    SDHCI_CAN_DDR50 | SDHCI_CAN_MMC_HS400);
+	if (off == SDHCI_CAPABILITIES2)
+		val32 = sdhci_fdt_soc_filter_caps2(dev, val32);
 
 	return (val32);
+}
+
+uint32_t
+sdhci_fdt_slot_read_4(device_t dev, struct sdhci_slot *slot, bus_size_t off)
+{
+	struct sdhci_fdt_softc *sc = device_get_softc(dev);
+
+	return (bus_read_4(sc->mem_res[slot->num], off));
 }
 
 static void
@@ -401,6 +435,62 @@ sdhci_fdt_write_4(device_t dev, struct sdhci_slot *slot, bus_size_t off,
 	struct sdhci_fdt_softc *sc = device_get_softc(dev);
 
 	bus_write_4(sc->mem_res[slot->num], off, val);
+}
+
+void
+sdhci_fdt_slot_write_4(device_t dev, struct sdhci_slot *slot, bus_size_t off,
+    uint32_t val)
+{
+	struct sdhci_fdt_softc *sc = device_get_softc(dev);
+
+	bus_write_4(sc->mem_res[slot->num], off, val);
+}
+
+int
+sdhci_fdt_set_core_clock(device_t dev, int clock, uint64_t *actual)
+{
+
+	return (sdhci_fdt_set_core_clock_flags(dev, clock, 0, actual));
+}
+
+int
+sdhci_fdt_set_core_clock_flags(device_t dev, int clock, int flags,
+    uint64_t *actual)
+{
+	struct sdhci_fdt_softc *sc = device_get_softc(dev);
+	int error;
+
+	error = clk_set_freq(sc->clk_core, clock, flags);
+	if (error != 0)
+		return (error);
+
+	if (actual != NULL)
+		return (clk_get_freq(sc->clk_core, actual));
+
+	return (0);
+}
+
+static int
+sdhci_fdt_init_core_clock(struct sdhci_fdt_softc *sc)
+{
+	device_t dev;
+	int error;
+
+	dev = sc->dev;
+
+	error = clk_get_by_ofw_name(dev, 0, "core", &sc->clk_core);
+	if (error != 0) {
+		device_printf(dev, "cannot get core clock: %d\n", error);
+		return (error);
+	}
+	error = clk_enable(sc->clk_core);
+	if (error != 0) {
+		device_printf(dev, "cannot enable core clock: %d\n", error);
+		return (error);
+	}
+	sdhci_fdt_soc_clock_bringup(dev);
+
+	return (0);
 }
 
 static void
@@ -446,10 +536,14 @@ sdhci_fdt_set_clock(device_t dev, struct sdhci_slot *slot, int clock)
 {
 	struct sdhci_fdt_softc *sc = device_get_softc(dev);
 	int32_t val;
-	int i;
+	int i, compat;
 
-	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data ==
-	    SDHCI_FDT_RK3568) {
+	compat = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+
+	if (sdhci_fdt_soc_set_clock(dev, slot, &clock))
+		return (clock);
+
+	if (compat == SDHCI_FDT_RK3568) {
 		if (clock == 400000)
 			clock = 375000;
 
@@ -501,12 +595,35 @@ sdhci_fdt_set_clock(device_t dev, struct sdhci_slot *slot, int clock)
 	return (clock);
 }
 
+static void
+sdhci_fdt_reset(device_t dev, struct sdhci_slot *slot, uint8_t mask)
+{
+	struct sdhci_fdt_softc *sc;
+	int error;
+
+	sc = device_get_softc(dev);
+	if ((mask & SDHCI_RESET_ALL) != 0 && sc->resets != NULL) {
+		error = hwreset_array_assert(sc->resets);
+		if (error != 0)
+			device_printf(dev,
+			    "cannot assert controller resets: %d\n", error);
+		DELAY(1);
+		error = hwreset_array_deassert(sc->resets);
+		if (error != 0)
+			device_printf(dev,
+			    "cannot deassert controller resets: %d\n", error);
+	}
+	sdhci_generic_reset(dev, slot, mask);
+	sdhci_fdt_soc_post_reset(dev, slot, mask);
+}
+
 static int
 sdhci_fdt_probe(device_t dev)
 {
 	struct sdhci_fdt_softc *sc = device_get_softc(dev);
 	phandle_t node;
 	pcell_t cid;
+	int compat;
 
 	sc->quirks = 0;
 	sc->num_slots = 1;
@@ -515,7 +632,8 @@ sdhci_fdt_probe(device_t dev)
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	switch (ofw_bus_search_compatible(dev, compat_data)->ocd_data) {
+	compat = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+	switch (compat) {
 	case SDHCI_FDT_ARMADA38X:
 		sc->quirks = SDHCI_QUIRK_BROKEN_AUTO_STOP;
 		device_set_desc(dev, "ARMADA38X SDHCI controller");
@@ -534,13 +652,16 @@ sdhci_fdt_probe(device_t dev)
 		device_set_desc(dev, "Zynq-7000 generic fdt SDHCI controller");
 		break;
 	case SDHCI_FDT_RK3568:
-		device_set_desc(dev, "Rockchip RK3568 fdt SDHCI controller");
+		device_set_desc(dev,
+		    "Rockchip RK3568 fdt SDHCI controller");
 		break;
 	case SDHCI_FDT_XLNX_ZMP:
 		device_set_desc(dev, "ZynqMP generic fdt SDHCI controller");
 		break;
 	default:
-		return (ENXIO);
+		if (!sdhci_fdt_soc_probe(dev))
+			return (ENXIO);
+		break;
 	}
 
 	node = ofw_bus_get_node(dev);
@@ -554,10 +675,14 @@ sdhci_fdt_probe(device_t dev)
 		sc->max_clk = cid;
 	if (OF_hasprop(node, "no-1-8-v"))
 		sc->no_18v = true;
+	if (OF_hasprop(node, "non-removable"))
+		sc->quirks |= SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE;
 	if (OF_hasprop(node, "wp-inverted"))
 		sc->wp_inverted = true;
 	if (OF_hasprop(node, "disable-wp"))
 		sc->wp_disabled = true;
+	sdhci_fdt_soc_probe_setup(dev, &sc->quirks);
+	sdhci_fdt_soc_post_fdt_parse(dev, &sc->quirks, &sc->wp_disabled);
 
 	return (0);
 }
@@ -608,14 +733,28 @@ sdhci_fdt_attach(device_t dev)
 		break;
 	case SDHCI_FDT_RK3568:
 		/* setup & enable clocks */
-		if (clk_get_by_ofw_name(dev, 0, "core", &sc->clk_core)) {
-			device_printf(dev, "cannot get core clock\n");
-			return (ENXIO);
-		}
-		clk_enable(sc->clk_core);
+		err = sdhci_fdt_init_core_clock(sc);
+		if (err != 0)
+			return (err);
 		break;
 	default:
+		if (sdhci_fdt_soc_uses_core_clock(dev)) {
+			err = sdhci_fdt_init_core_clock(sc);
+			if (err != 0)
+				return (err);
+		}
 		break;
+	}
+
+	if (sdhci_fdt_soc_uses_controller_resets(dev) &&
+	    OF_hasprop(ofw_bus_get_node(dev), "resets")) {
+		err = hwreset_array_get_ofw(dev, 0, &sc->resets);
+		if (err != 0) {
+			device_printf(dev,
+			    "cannot acquire controller resets: %d\n", err);
+			return (err);
+		}
+		device_printf(dev, "controller reset array enabled\n");
 	}
 
 	/* Scan all slots. */
@@ -638,6 +777,8 @@ sdhci_fdt_attach(device_t dev)
 		slot->caps = sc->caps;
 		slot->max_clk = sc->max_clk;
 		slot->sdma_boundary = sc->sdma_boundary;
+
+		sdhci_fdt_soc_init_slot(dev, slot);
 
 		if (sdhci_init_slot(dev, slot, i) != 0)
 			continue;
@@ -677,6 +818,8 @@ sdhci_fdt_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY,
 		    rman_get_rid(sc->mem_res[i]), sc->mem_res[i]);
 	}
+	if (sc->resets != NULL)
+		hwreset_array_release(sc->resets);
 
 	return (0);
 }
@@ -695,6 +838,9 @@ static device_method_t sdhci_fdt_methods[] = {
 	DEVMETHOD(mmcbr_update_ios,	sdhci_generic_update_ios),
 	DEVMETHOD(mmcbr_request,	sdhci_generic_request),
 	DEVMETHOD(mmcbr_get_ro,		sdhci_fdt_get_ro),
+	DEVMETHOD(mmcbr_switch_vccq,	sdhci_generic_switch_vccq),
+	DEVMETHOD(mmcbr_tune,		sdhci_generic_tune),
+	DEVMETHOD(mmcbr_retune,		sdhci_generic_retune),
 	DEVMETHOD(mmcbr_acquire_host,	sdhci_generic_acquire_host),
 	DEVMETHOD(mmcbr_release_host,	sdhci_generic_release_host),
 
@@ -708,6 +854,8 @@ static device_method_t sdhci_fdt_methods[] = {
 	DEVMETHOD(sdhci_write_4,	sdhci_fdt_write_4),
 	DEVMETHOD(sdhci_write_multi_4,	sdhci_fdt_write_multi_4),
 	DEVMETHOD(sdhci_set_clock,	sdhci_fdt_set_clock),
+	DEVMETHOD(sdhci_set_uhs_timing,	sdhci_generic_set_uhs_timing),
+	DEVMETHOD(sdhci_reset,		sdhci_fdt_reset),
 
 	DEVMETHOD_END
 };

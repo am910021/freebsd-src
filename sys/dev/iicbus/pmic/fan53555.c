@@ -59,6 +59,11 @@
 #define	 FAN53555_ID2_DIE_REV(x)	((x) & 0x0F)
 #define	FAN53555_MON		0x05
 
+#define	RK8602_VSEL0		0x06
+#define	RK8602_VSEL1		0x07
+#define	RK8602_VSEL_MASK	0xff
+#define	RK8602_ENABLE_TIME	360
+
 #define	TCS4525_VSEL0		0x11
 #define	TCS4525_VSEL1		0x10
 #define	TCS4525_CHIP_ID_12	12
@@ -75,6 +80,19 @@ enum fan53555_pmic_type {
 	SYR827,
 	SYR828,
 	TCS4525,
+	RK8602,
+};
+
+struct fan53555_chip_info {
+	enum fan53555_pmic_type	type;
+	const char		*desc;
+	uint8_t			vsel0_reg;
+	uint8_t			vsel1_reg;
+	uint8_t			enable0_reg;
+	uint8_t			enable1_reg;
+	uint8_t			vsel_mask;
+	int			enable_time;
+	bool			read_id;
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -82,6 +100,8 @@ static struct ofw_compat_data compat_data[] = {
 	{"silergy,syr827",	SYR827},
 	{"silergy,syr828",	SYR828},
 	{"tcs,tcs4525",		TCS4525},
+	{"rockchip,rk8602",	RK8602},
+	{"rockchip,rk8603",	RK8602},
 	{NULL,		0}
 };
 
@@ -91,14 +111,20 @@ struct fan53555_reg_sc {
 	device_t		base_dev;
 	uint8_t			live_reg;
 	uint8_t			sleep_reg;
+	uint8_t			enable_reg;
+	uint8_t			vsel_mask;
 	struct regulator_range	*range;
 	struct regnode_std_param *param;
 };
 
 struct fan53555_softc {
 	device_t		dev;
+	const struct fan53555_chip_info *chip;
 	uint8_t			live_reg;
 	uint8_t			sleep_reg;
+	uint8_t			enable_reg;
+	uint8_t			vsel_mask;
+	int			enable_time;
 };
 
 static struct regulator_range syr_8_range =
@@ -115,6 +141,74 @@ static struct regulator_range fan_4_range =
 
 static struct regulator_range tcs_12_range =
    REG_RANGE_INIT(  0, 0x3F,  800000, 6250);
+
+static struct regulator_range rk8602_range =
+   REG_RANGE_INIT(  0, 0x9F,  500000, 6250);
+
+static const struct fan53555_chip_info fan53555_chips[] = {
+	{
+		.type = FAN53555,
+		.desc = "FAN53555 PMIC",
+		.vsel0_reg = FAN53555_VSEL0,
+		.vsel1_reg = FAN53555_VSEL1,
+		.enable0_reg = FAN53555_VSEL0,
+		.enable1_reg = FAN53555_VSEL1,
+		.vsel_mask = FAN53555_VSEL_MASK,
+		.read_id = true,
+	},
+	{
+		.type = SYR827,
+		.desc = "SYR827 PMIC",
+		.vsel0_reg = FAN53555_VSEL0,
+		.vsel1_reg = FAN53555_VSEL1,
+		.enable0_reg = FAN53555_VSEL0,
+		.enable1_reg = FAN53555_VSEL1,
+		.vsel_mask = FAN53555_VSEL_MASK,
+		.read_id = true,
+	},
+	{
+		.type = SYR828,
+		.desc = "SYR828 PMIC",
+		.vsel0_reg = FAN53555_VSEL0,
+		.vsel1_reg = FAN53555_VSEL1,
+		.enable0_reg = FAN53555_VSEL0,
+		.enable1_reg = FAN53555_VSEL1,
+		.vsel_mask = FAN53555_VSEL_MASK,
+		.read_id = true,
+	},
+	{
+		.type = TCS4525,
+		.desc = "TCS4525 PMIC",
+		.vsel0_reg = TCS4525_VSEL0,
+		.vsel1_reg = TCS4525_VSEL1,
+		.enable0_reg = TCS4525_VSEL0,
+		.enable1_reg = TCS4525_VSEL1,
+		.vsel_mask = FAN53555_VSEL_MASK,
+		.read_id = true,
+	},
+	{
+		.type = RK8602,
+		.desc = "Rockchip RK8602/RK8603 regulator",
+		.vsel0_reg = RK8602_VSEL0,
+		.vsel1_reg = RK8602_VSEL1,
+		.enable0_reg = FAN53555_VSEL0,
+		.enable1_reg = FAN53555_VSEL1,
+		.vsel_mask = RK8602_VSEL_MASK,
+		.enable_time = RK8602_ENABLE_TIME,
+	},
+};
+
+static const struct fan53555_chip_info *
+fan53555_get_chip_info(enum fan53555_pmic_type type)
+{
+	int i;
+
+	for (i = 0; i < nitems(fan53555_chips); i++) {
+		if (fan53555_chips[i].type == type)
+			return (&fan53555_chips[i]);
+	}
+	return (NULL);
+}
 
 static int
 fan53555_read(device_t dev, uint8_t reg, uint8_t *val)
@@ -171,7 +265,7 @@ fan53555_read_sel(struct fan53555_reg_sc *sc, uint8_t *sel)
 	rv = fan53555_read(sc->base_dev, sc->live_reg, sel);
 	if (rv != 0)
 		return (rv);
-	*sel &= FAN53555_VSEL_MASK;
+	*sel &= sc->vsel_mask;
 	return (0);
 }
 
@@ -184,7 +278,7 @@ fan53555_write_sel(struct fan53555_reg_sc *sc, uint8_t sel)
 	rv = fan53555_read(sc->base_dev, sc->live_reg, &reg);
 	if (rv != 0)
 		return (rv);
-	reg &= ~FAN53555_VSEL_MASK;
+	reg &= ~sc->vsel_mask;
 	reg |= sel;
 
 	rv = fan53555_write(sc->base_dev, sc->live_reg, reg);
@@ -209,17 +303,35 @@ fan53555_regnode_enable(struct regnode *regnode, bool enable, int *udelay)
 
 	dprintf(sc, "%sabling regulator %s\n", enable ? "En" : "Dis",
 	    sc->name);
-	fan53555_read(sc->base_dev, sc->live_reg, &val);
+	fan53555_read(sc->base_dev, sc->enable_reg, &val);
 	if (enable)
 		val |=FAN53555_VSEL_ENA;
 	else
 		val &= ~FAN53555_VSEL_ENA;
-	fan53555_write(sc->base_dev, sc->live_reg, val);
+	fan53555_write(sc->base_dev, sc->enable_reg, val);
 
 	*udelay = sc->param->enable_delay;
 	return (0);
 }
 
+static int
+fan53555_regnode_status(struct regnode *regnode, int *status)
+{
+	struct fan53555_reg_sc *sc;
+	uint8_t val;
+	int rv;
+
+	sc = regnode_get_softc(regnode);
+	*status = 0;
+
+	rv = fan53555_read(sc->base_dev, sc->enable_reg, &val);
+	if (rv != 0)
+		return (rv);
+	if ((val & FAN53555_VSEL_ENA) != 0)
+		*status = REGULATOR_STATUS_ENABLED;
+
+	return (0);
+}
 
 static int
 fan53555_regnode_set_voltage(struct regnode *regnode, int min_uvolt,
@@ -272,18 +384,19 @@ static regnode_method_t fan53555_regnode_methods[] = {
 	/* Regulator interface */
 	REGNODEMETHOD(regnode_init,		fan53555_regnode_init),
 	REGNODEMETHOD(regnode_enable,		fan53555_regnode_enable),
+	REGNODEMETHOD(regnode_status,		fan53555_regnode_status),
 	REGNODEMETHOD(regnode_set_voltage,	fan53555_regnode_set_voltage),
 	REGNODEMETHOD(regnode_get_voltage,	fan53555_regnode_get_voltage),
+	REGNODEMETHOD(regnode_check_voltage,	regnode_method_check_voltage),
 	REGNODEMETHOD_END
 };
 DEFINE_CLASS_1(fan53555_regnode, fan53555_regnode_class,
     fan53555_regnode_methods, sizeof(struct fan53555_reg_sc), regnode_class);
 
 static struct regulator_range *
-fan53555_get_range(struct fan53555_softc *sc, int type, uint8_t id,
-    uint8_t rev)
+fan53555_get_range(struct fan53555_softc *sc, uint8_t id, uint8_t rev)
 {
-	if (type == SYR827 || type == SYR828) {
+	if (sc->chip->type == SYR827 || sc->chip->type == SYR828) {
 		switch (id) {
 		case 8:
 			return (&syr_8_range);
@@ -292,7 +405,7 @@ fan53555_get_range(struct fan53555_softc *sc, int type, uint8_t id,
 		}
 	}
 
-	if (type == FAN53555) {
+	if (sc->chip->type == FAN53555) {
 		switch (id) {
 		case 0:
 			if (rev == 0)
@@ -313,7 +426,7 @@ fan53555_get_range(struct fan53555_softc *sc, int type, uint8_t id,
 		}
 	}
 
-	if (type == TCS4525) {
+	if (sc->chip->type == TCS4525) {
 		switch (id) {
 		case TCS4525_CHIP_ID_12:
 			return (&tcs_12_range);
@@ -322,16 +435,19 @@ fan53555_get_range(struct fan53555_softc *sc, int type, uint8_t id,
 		}
 	}
 
+	if (sc->chip->type == RK8602)
+		return (&rk8602_range);
+
 	return (NULL);
 }
 
 static struct fan53555_reg_sc *
-fan53555_reg_attach(struct fan53555_softc *sc, phandle_t node, int  type)
+fan53555_reg_attach(struct fan53555_softc *sc, phandle_t node)
 {
 	struct fan53555_reg_sc *reg_sc;
 	struct regnode_init_def initdef;
 	struct regnode *regnode;
-	static struct regulator_range *range;
+	struct regulator_range *range;
 	uint8_t id1, id2;
 
 	memset(&initdef, 0, sizeof(initdef));
@@ -340,19 +456,21 @@ fan53555_reg_attach(struct fan53555_softc *sc, phandle_t node, int  type)
 		return (NULL);
 	}
 
-	if (fan53555_read(sc->dev, FAN53555_ID1, &id1) != 0) {
+	if (!sc->chip->read_id) {
+		id1 = 0;
+		id2 = 0;
+		range = fan53555_get_range(sc, id1, id2);
+	} else if (fan53555_read(sc->dev, FAN53555_ID1, &id1) != 0) {
 		device_printf(sc->dev, "cannot read ID1\n");
 		return (NULL);
-	}
-
-	if (fan53555_read(sc->dev, FAN53555_ID2, &id2) != 0) {
+	} else if (fan53555_read(sc->dev, FAN53555_ID2, &id2) != 0) {
 		device_printf(sc->dev, "cannot read ID2\n");
 		return (NULL);
+	} else {
+		dprintf(sc, "Device ID1: 0x%02X, ID2: 0x%02X\n", id1, id2);
+		range = fan53555_get_range(sc, FAN53555_ID1_DIE_ID(id1),
+		     FAN53555_ID2_DIE_REV(id2));
 	}
-	dprintf(sc, "Device ID1: 0x%02X, ID2: 0x%02X\n", id1, id2);
-
-	range = fan53555_get_range(sc, type, FAN53555_ID1_DIE_ID(id1),
-	     FAN53555_ID2_DIE_REV(id2));
 	if (range == NULL) {
 		device_printf(sc->dev,
 		    "cannot determine chip type (ID1: 0x%02X, ID2: 0x%02X)\n",
@@ -377,9 +495,18 @@ fan53555_reg_attach(struct fan53555_softc *sc, phandle_t node, int  type)
 	reg_sc->range = range;
 	reg_sc->live_reg = sc->live_reg;
 	reg_sc->sleep_reg = sc->sleep_reg;
+	reg_sc->enable_reg = sc->enable_reg;
+	reg_sc->vsel_mask = sc->vsel_mask;
+	if (sc->enable_time != 0 && reg_sc->param->enable_delay == 0)
+		reg_sc->param->enable_delay = sc->enable_time;
 
-	dprintf(sc->dev, "live_reg: %d, sleep_reg: %d\n", reg_sc->live_reg,
-	    reg_sc->sleep_reg);
+	if (bootverbose)
+		device_printf(sc->dev,
+		    "fan53555 regulator name=%s live=0x%02x sleep=0x%02x "
+		    "enable=0x%02x mask=0x%02x enable_delay=%d\n",
+		    regnode_get_name(regnode), reg_sc->live_reg,
+		    reg_sc->sleep_reg, reg_sc->enable_reg, reg_sc->vsel_mask,
+		    reg_sc->param->enable_delay);
 
 	regnode_register(regnode);
 
@@ -409,28 +536,17 @@ fan53555_reg_attach(struct fan53555_softc *sc, phandle_t node, int  type)
 static int
 fan53555_probe(device_t dev)
 {
+	const struct fan53555_chip_info *info;
 	int type;
 
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
 	type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
-	switch (type) {
-	case FAN53555:
-		device_set_desc(dev, "FAN53555 PMIC");
-		break;
-	case SYR827:
-		device_set_desc(dev, "SYR827 PMIC");
-		break;
-	case SYR828:
-		device_set_desc(dev, "SYR828 PMIC");
-		break;
-	case TCS4525:
-		device_set_desc(dev, "TCS4525 PMIC");
-		break;
-	default:
+	info = fan53555_get_chip_info(type);
+	if (info == NULL)
 		return (ENXIO);
-	}
+	device_set_desc(dev, info->desc);
 
 	return (BUS_PROBE_DEFAULT);
 }
@@ -446,37 +562,28 @@ fan53555_attach(device_t dev)
 	sc->dev = dev;
 	node = ofw_bus_get_node(dev);
 	type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+	sc->chip = fan53555_get_chip_info(type);
+	if (sc->chip == NULL)
+		return (ENXIO);
+	sc->vsel_mask = sc->chip->vsel_mask;
+	sc->enable_time = sc->chip->enable_time;
 
 	rv = OF_getencprop(node, "fcs,suspend-voltage-selector", &susp_sel,
 		sizeof(susp_sel));
 	if (rv <= 0)
 		susp_sel = 1;
 
-	switch (type) {
-	case FAN53555:
-	case SYR827:
-	case SYR828:
-		if (susp_sel == 1) {
-			sc->live_reg = FAN53555_VSEL0;
-			sc->sleep_reg = FAN53555_VSEL1;
-		} else {
-			sc->live_reg = FAN53555_VSEL1;
-			sc->sleep_reg = FAN53555_VSEL0;
-		}
-		break;
-	case TCS4525:
-		if (susp_sel == 1) {
-			sc->live_reg = TCS4525_VSEL0;
-			sc->sleep_reg = TCS4525_VSEL1;
-		} else {
-			sc->live_reg = TCS4525_VSEL1;
-			sc->sleep_reg = TCS4525_VSEL0;
-		}
-		break;
-	default:
-		return (ENXIO);
+	if (susp_sel == 1) {
+		sc->live_reg = sc->chip->vsel0_reg;
+		sc->sleep_reg = sc->chip->vsel1_reg;
+		sc->enable_reg = sc->chip->enable0_reg;
+	} else {
+		sc->live_reg = sc->chip->vsel1_reg;
+		sc->sleep_reg = sc->chip->vsel0_reg;
+		sc->enable_reg = sc->chip->enable1_reg;
 	}
-	if (fan53555_reg_attach(sc, node, type) == NULL)
+
+	if (fan53555_reg_attach(sc, node) == NULL)
 		device_printf(dev, "cannot attach regulator.\n");
 
 	return (0);

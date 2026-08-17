@@ -333,7 +333,9 @@ struct  regfix_softc
 {
 	device_t			dev;
 	bool				attach_done;
+	bool				late_retry_scheduled;
 	struct regnode_fixed_init_def	init_def;
+	const char			*gpio_prop;
 	phandle_t			gpio_prodxref;
 	pcell_t				*gpio_cells;
 	int				gpio_ncells;
@@ -344,6 +346,21 @@ static struct ofw_compat_data compat_data[] = {
 	{"regulator-fixed",		1},
 	{NULL,				0},
 };
+
+static const char *
+regfix_name(struct regfix_softc *sc)
+{
+	char *name;
+
+	name = sc->init_def.reg_init_def.name;
+	if (name != NULL)
+		return (name);
+	return (device_get_nameunit(sc->dev));
+}
+
+static int regfix_regdev_map(device_t dev, phandle_t xref, int ncells,
+    pcell_t *cells, intptr_t *id);
+static void regfix_retry_register(void *arg);
 
 static int
 regfix_get_gpio(struct regfix_softc * sc)
@@ -360,22 +377,126 @@ regfix_get_gpio(struct regfix_softc * sc)
 
 	/* Test if controller exist. */
 	sc->gpio_pin.dev = OF_device_from_xref(sc->gpio_prodxref);
-	if (sc->gpio_pin.dev == NULL)
+	if (sc->gpio_pin.dev == NULL) {
+		if (bootverbose)
+			device_printf(sc->dev,
+			    "%s provider xref %#x is not ready\n",
+			    sc->gpio_prop != NULL ? sc->gpio_prop : "gpio",
+			    sc->gpio_prodxref);
 		return (ENODEV);
+	}
 
 	/* Test if GPIO bus already exist. */
 	busdev = GPIO_GET_BUS(sc->gpio_pin.dev);
-	if (busdev == NULL)
+	if (busdev == NULL) {
+		if (bootverbose)
+			device_printf(sc->dev,
+			    "%s provider %s has no GPIO bus\n",
+			    sc->gpio_prop != NULL ? sc->gpio_prop : "gpio",
+			    device_get_nameunit(sc->gpio_pin.dev));
 		return (ENODEV);
+	}
 
 	rv = gpio_map_gpios(sc->gpio_pin.dev, node,
 	    OF_node_from_xref(sc->gpio_prodxref), sc->gpio_ncells,
 	    sc->gpio_cells, &(sc->gpio_pin.pin), &(sc->gpio_pin.flags));
 	if (rv != 0) {
-		device_printf(sc->dev, "Cannot map the gpio property.\n");
+		if (bootverbose)
+			device_printf(sc->dev,
+			    "cannot map %s GPIO from %s: %d\n",
+			    sc->gpio_prop != NULL ? sc->gpio_prop : "gpio",
+			    device_get_nameunit(sc->gpio_pin.dev), rv);
 		return (ENXIO);
 	}
 	sc->init_def.gpio_pin = &sc->gpio_pin;
+	return (0);
+}
+
+static int
+regfix_try_register(struct regfix_softc *sc, const char *where)
+{
+	int rv;
+
+	if (sc->attach_done)
+		return (0);
+
+	rv = regfix_get_gpio(sc);
+	if (rv != 0) {
+		if (!sc->late_retry_scheduled) {
+			sc->late_retry_scheduled = true;
+			config_intrhook_oneshot(regfix_retry_register, sc);
+			if (bootverbose)
+				device_printf(sc->dev,
+				    "scheduled regulator %s retry at %s: %d\n",
+				    regfix_name(sc), where, rv);
+		}
+		if (bootverbose)
+			device_printf(sc->dev,
+			    "deferred regulator %s registration at %s: %d\n",
+			    regfix_name(sc), where, rv);
+		return (rv);
+	}
+
+	rv = regnode_fixed_register(sc->dev, &sc->init_def);
+	if (rv != 0) {
+		device_printf(sc->dev,
+		    "cannot register regulator %s at %s: %d\n",
+		    regfix_name(sc), where, rv);
+		return (rv);
+	}
+
+	sc->attach_done = true;
+	return (0);
+}
+
+static void
+regfix_retry_register(void *arg)
+{
+	struct regfix_softc *sc;
+
+	sc = arg;
+	sc->late_retry_scheduled = false;
+	if (sc->attach_done)
+		return;
+	(void)regfix_try_register(sc, "intrhook");
+}
+
+static int
+regfix_regdev_map(device_t dev, phandle_t xref, int ncells, pcell_t *cells,
+    intptr_t *id)
+{
+	struct regfix_softc *sc;
+
+	sc = device_get_softc(dev);
+	if (sc != NULL && !sc->attach_done)
+		(void)regfix_try_register(sc, "map");
+
+	return (regdev_default_ofw_map(dev, xref, ncells, cells, id));
+}
+
+static int
+regfix_parse_gpio_prop(struct regfix_softc *sc, phandle_t node)
+{
+	int rv;
+
+	if (OF_hasprop(node, "gpio")) {
+		sc->gpio_prop = "gpio";
+		rv = ofw_bus_parse_xref_list_alloc(node, "gpio", "#gpio-cells",
+		    0, &sc->gpio_prodxref, &sc->gpio_ncells,
+		    &sc->gpio_cells);
+	} else if (OF_hasprop(node, "gpios")) {
+		sc->gpio_prop = "gpios";
+		rv = ofw_bus_parse_xref_list_alloc(node, "gpios",
+		    "#gpio-cells", 0, &sc->gpio_prodxref, &sc->gpio_ncells,
+		    &sc->gpio_cells);
+	} else {
+		return (0);
+	}
+	if (rv != 0) {
+		sc->gpio_prodxref = 0;
+		device_printf(sc->dev, "Malformed gpio/gpios property\n");
+		return (ENXIO);
+	}
 	return (0);
 }
 
@@ -409,23 +530,13 @@ regfix_parse_fdt(struct regfix_softc * sc)
 	if (OF_hasprop(node, "gpio-open-drain"))
 		sc->init_def.gpio_open_drain = true;
 
-	if (!OF_hasprop(node, "gpio"))
-		return (0);
-	rv = ofw_bus_parse_xref_list_alloc(node, "gpio", "#gpio-cells", 0,
-	    &sc->gpio_prodxref, &sc->gpio_ncells, &sc->gpio_cells);
-	if (rv != 0) {
-		sc->gpio_prodxref = 0;
-		device_printf(sc->dev, "Malformed gpio property\n");
-		return (ENXIO);
-	}
-	return (0);
+	return (regfix_parse_gpio_prop(sc, node));
 }
 
 static void
 regfix_new_pass(device_t dev)
 {
 	struct regfix_softc * sc;
-	int rv;
 
 	sc = device_get_softc(dev);
 	bus_generic_new_pass(dev);
@@ -433,14 +544,7 @@ regfix_new_pass(device_t dev)
 	if (sc->attach_done)
 		return;
 
-	/* Try to get and configure GPIO. */
-	rv = regfix_get_gpio(sc);
-	if (rv != 0)
-		return;
-
-	/* Register regulator. */
-	regnode_fixed_register(sc->dev, &sc->init_def);
-	sc->attach_done = true;
+	(void)regfix_try_register(sc, "new-pass");
 }
 
 static int
@@ -469,10 +573,12 @@ static int
 regfix_attach(device_t dev)
 {
 	struct regfix_softc * sc;
+	phandle_t node;
 	int rv;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	node = ofw_bus_get_node(dev);
 
 	/* Parse FDT data. */
 	rv = regfix_parse_fdt(sc);
@@ -483,14 +589,10 @@ regfix_attach(device_t dev)
 	sc->init_def.reg_init_def.id = 1;
 	sc->init_def.reg_init_def.flags = REGULATOR_FLAGS_STATIC;
 
-	/* Try to get and configure GPIO. */
-	rv = regfix_get_gpio(sc);
-	if (rv != 0)
-		return (bus_generic_attach(dev));
+	if (node > 0)
+		OF_device_register_xref(OF_xref_from_node(node), dev);
 
-	/* Register regulator. */
-	regnode_fixed_register(sc->dev, &sc->init_def);
-	sc->attach_done = true;
+	(void)regfix_try_register(sc, "attach");
 
 	return (bus_generic_attach(dev));
 }
@@ -503,7 +605,7 @@ static device_method_t regfix_methods[] = {
 	/* Bus interface */
 	DEVMETHOD(bus_new_pass,		regfix_new_pass),
 	/* Regdev interface */
-	DEVMETHOD(regdev_map,		regdev_default_ofw_map),
+	DEVMETHOD(regdev_map,		regfix_regdev_map),
 
 	DEVMETHOD_END
 };

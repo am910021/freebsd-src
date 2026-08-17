@@ -345,6 +345,13 @@ typedef struct ehci_softc {
 #define	EHCI_SCFLG_DONTRESET	0x0100	/* don't reset ctrl. in ehci_init() */
 #define	EHCI_SCFLG_DONEINIT	0x1000	/* ehci_init() has been called. */
 
+	uint8_t	sc_init_quirks;		/* controller initialization quirks */
+#define	EHCI_INITQ_MMIO_BARRIER		0x01
+#define	EHCI_INITQ_INTR_AFTER_RUN	0x02
+#define	EHCI_INITQ_ITC_2		0x04
+#define	EHCI_INITQ_INTR_QH_FRAMELIST	0x08
+#define	EHCI_INITQ_NRL_4		0x10
+
 	uint8_t	sc_offs;		/* offset to operational registers */
 	uint8_t	sc_doorbell_disable;	/* set on doorbell failure */
 	uint8_t	sc_noport;

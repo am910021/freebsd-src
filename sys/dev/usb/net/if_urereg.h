@@ -440,8 +440,8 @@
 #define	URE_PCUT_STATUS		0x0001
 
 /* USB_RX_EARLY_TIMEOUT */
-#define	URE_COALESCE_SUPER	85000U
-#define	URE_COALESCE_HIGH	250000U
+#define	URE_COALESCE_SUPER	524280U
+#define	URE_COALESCE_HIGH	524280U
 #define	URE_COALESCE_SLOW	524280U
 
 /* USB_WDT11_CTRL */
@@ -570,8 +570,10 @@ struct ure_txpkt {
 
 #define	URE_MAX_TX	4
 #define	URE_MAX_RX	4
+#define	URE_TX_ACTIVE_MASK	((1U << URE_MAX_TX) - 1)
 
 #define	URE_TX_BUFSZ		16384
+#define	URE_HS_TX_BUFSZ	(64 * 1024)
 #define	URE_8152_RX_BUFSZ	(16 * 1024)
 #define	URE_8153_RX_BUFSZ	(32 * 1024)
 #define	URE_8156_RX_BUFSZ	(48 * 1024)
@@ -583,9 +585,12 @@ struct ure_softc {
 	struct mtx		sc_mtx;
 	struct usb_xfer		*sc_rx_xfer[URE_MAX_RX];
 	struct usb_xfer		*sc_tx_xfer[URE_MAX_TX];
+	struct lro_ctrl		sc_lro;
+	bool			sc_lro_initialized;
 
 	int			sc_rxbufsz;
 	int			sc_rxstarted;
+	u_int			sc_tx_active;
 
 	int			sc_phyno;
 

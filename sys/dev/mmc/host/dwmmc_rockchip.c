@@ -28,8 +28,10 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/bus.h>
+#include <sys/eventhandler.h>
 #include <sys/module.h>
 #include <sys/queue.h>
+#include <sys/reboot.h>
 #include <sys/taskqueue.h>
 
 #include <machine/bus.h>
@@ -41,6 +43,7 @@
 
 #include <dev/extres/clk/clk.h>
 
+#include <dev/mmc/host/dwmmc_soc.h>
 #include <dev/mmc/host/dwmmc_var.h>
 
 #include "opt_mmccam.h"
@@ -58,6 +61,17 @@ static struct ofw_compat_data compat_data[] = {
 
 static int dwmmc_rockchip_update_ios(struct dwmmc_softc *sc, struct mmc_ios *ios);
 
+static void
+rockchip_dwmmc_shutdown_post_sync(void *arg, int howto)
+{
+	struct dwmmc_softc *sc;
+
+	if ((howto & RB_NOSYNC) != 0)
+		return;
+	sc = arg;
+	(void)dwmmc_prepare_reboot(sc->dev);
+}
+
 static int
 rockchip_dwmmc_probe(device_t dev)
 {
@@ -65,7 +79,8 @@ rockchip_dwmmc_probe(device_t dev)
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
+	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0 &&
+	    !dwmmc_soc_probe(dev))
 		return (ENXIO);
 
 	device_set_desc(dev, "Synopsys DesignWare Mobile "
@@ -78,7 +93,7 @@ static int
 rockchip_dwmmc_attach(device_t dev)
 {
 	struct dwmmc_softc *sc;
-	int type;
+	int error, type;
 
 	sc = device_get_softc(dev);
 	sc->hwtype = HWTYPE_ROCKCHIP;
@@ -92,7 +107,24 @@ rockchip_dwmmc_attach(device_t dev)
 
 	sc->update_ios = &dwmmc_rockchip_update_ios;
 
-	return (dwmmc_attach(dev));
+	error = dwmmc_attach(dev);
+	if (error == 0 && dwmmc_soc_needs_reboot_prepare(sc))
+		sc->shutdown_eh = EVENTHANDLER_REGISTER(shutdown_post_sync,
+		    rockchip_dwmmc_shutdown_post_sync, sc, SHUTDOWN_PRI_LAST);
+	return (error);
+}
+
+static int
+rockchip_dwmmc_detach(device_t dev)
+{
+	struct dwmmc_softc *sc;
+
+	sc = device_get_softc(dev);
+	if (sc->shutdown_eh != NULL) {
+		EVENTHANDLER_DEREGISTER(shutdown_post_sync, sc->shutdown_eh);
+		sc->shutdown_eh = NULL;
+	}
+	return (dwmmc_detach(dev));
 }
 
 static int
@@ -126,7 +158,7 @@ static device_method_t rockchip_dwmmc_methods[] = {
 	/* bus interface */
 	DEVMETHOD(device_probe, rockchip_dwmmc_probe),
 	DEVMETHOD(device_attach, rockchip_dwmmc_attach),
-	DEVMETHOD(device_detach, dwmmc_detach),
+	DEVMETHOD(device_detach, rockchip_dwmmc_detach),
 
 	DEVMETHOD_END
 };

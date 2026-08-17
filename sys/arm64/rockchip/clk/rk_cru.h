@@ -56,6 +56,16 @@
 	.shift = _s,							\
 }
 
+#define	GATE_FLAGS(_idx, _clkname, _pname, _o, _s, _flags)		\
+{									\
+	.id = _idx,							\
+	.name = _clkname,						\
+	.parent_name = _pname,						\
+	.offset = CRU_CLKGATE_CON(_o),					\
+	.shift = _s,							\
+	.gate_flags = _flags,						\
+}
+
 /* Fixed rate clock. */
 #define	FRATE(_id, _name, _freq)					\
 {									\
@@ -214,6 +224,7 @@ struct rk_cru_gate {
 	uint32_t	id;
 	uint32_t	offset;
 	uint32_t	shift;
+	int		gate_flags;
 };
 
 enum rk_clk_type {
@@ -221,6 +232,7 @@ enum rk_clk_type {
 	RK3066_CLK_PLL,
 	RK3328_CLK_PLL,
 	RK3399_CLK_PLL,
+	RK3588_CLK_PLL,
 	RK_CLK_COMPOSITE,
 	RK_CLK_FIXED,
 	RK_CLK_FRACT,
@@ -242,6 +254,12 @@ struct rk_clk {
 	} clk;
 };
 
+struct rk_cru_reset {
+	uint32_t	id;
+	uint32_t	offset;
+	uint32_t	bit;
+};
+
 struct rk_cru_softc {
 	device_t		dev;
 	struct resource		*res;
@@ -250,8 +268,12 @@ struct rk_cru_softc {
 	int			type;
 	uint32_t		reset_offset;
 	uint32_t		reset_num;
+	const struct rk_cru_reset *reset_map;
+	int			nreset_map;
+	bool			reset_map_strict;
 	struct rk_cru_gate	*gates;
 	int			ngates;
+	int			gate_flags;
 	struct rk_clk		*clks;
 	int			nclks;
 	struct rk_clk_armclk_def	*armclk;

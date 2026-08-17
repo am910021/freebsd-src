@@ -54,6 +54,7 @@
 #include <vm/vm_radix.h>
 
 #include <machine/machdep.h>
+#include <machine/pmap.h>
 
 #include <arm64/iommu/iommu_pmap.h>
 #include <arm64/iommu/iommu_pte.h>
@@ -411,6 +412,7 @@ smmu_pmap_pinit(struct smmu_pmap *pmap)
 	    VM_ALLOC_ZERO);
 	pmap->sp_l0_paddr = VM_PAGE_TO_PHYS(m);
 	pmap->sp_l0 = (pd_entry_t *)PHYS_TO_DMAP(pmap->sp_l0_paddr);
+	cpu_dcache_wb_range((vm_offset_t)pmap->sp_l0, IOMMU_PAGE_SIZE);
 
 #ifdef INVARIANTS
 	pmap->sp_resident_count = 0;
@@ -459,6 +461,8 @@ _pmap_alloc_l3(struct smmu_pmap *pmap, vm_pindex_t ptepindex)
 	 * PTE within "m".
 	 */
 	dmb(ishst);
+	cpu_dcache_wb_range((vm_offset_t)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m)),
+	    IOMMU_PAGE_SIZE);
 
 	/*
 	 * Map the pagetable page into the process address space, if
@@ -472,6 +476,7 @@ _pmap_alloc_l3(struct smmu_pmap *pmap, vm_pindex_t ptepindex)
 		l0index = ptepindex - (NUL2E + NUL1E);
 		l0 = &pmap->sp_l0[l0index];
 		smmu_pmap_store(l0, VM_PAGE_TO_PHYS(m) | IOMMU_L0_TABLE);
+		cpu_dcache_wb_range((vm_offset_t)l0, sizeof(*l0));
 	} else if (ptepindex >= NUL2E) {
 		vm_pindex_t l0index, l1index;
 		pd_entry_t *l0, *l1;
@@ -498,6 +503,7 @@ _pmap_alloc_l3(struct smmu_pmap *pmap, vm_pindex_t ptepindex)
 		l1 = (pd_entry_t *)PHYS_TO_DMAP(smmu_pmap_load(l0) &~ATTR_MASK);
 		l1 = &l1[ptepindex & Ln_ADDR_MASK];
 		smmu_pmap_store(l1, VM_PAGE_TO_PHYS(m) | IOMMU_L1_TABLE);
+		cpu_dcache_wb_range((vm_offset_t)l1, sizeof(*l1));
 	} else {
 		vm_pindex_t l0index, l1index;
 		pd_entry_t *l0, *l1, *l2;
@@ -539,6 +545,7 @@ _pmap_alloc_l3(struct smmu_pmap *pmap, vm_pindex_t ptepindex)
 		l2 = (pd_entry_t *)PHYS_TO_DMAP(smmu_pmap_load(l1) &~ATTR_MASK);
 		l2 = &l2[ptepindex & Ln_ADDR_MASK];
 		smmu_pmap_store(l2, VM_PAGE_TO_PHYS(m) | IOMMU_L2_TABLE);
+		cpu_dcache_wb_range((vm_offset_t)l2, sizeof(*l2));
 	}
 
 	smmu_pmap_resident_count_inc(pmap, 1);
@@ -695,7 +702,7 @@ out:
  */
 int
 smmu_pmap_enter(struct smmu_pmap *pmap, vm_offset_t va, vm_paddr_t pa,
-    vm_prot_t prot, u_int flags)
+    vm_prot_t prot, u_int flags, vm_memattr_t memattr)
 {
 	pd_entry_t *pde;
 	pt_entry_t new_l3;
@@ -708,8 +715,14 @@ smmu_pmap_enter(struct smmu_pmap *pmap, vm_offset_t va, vm_paddr_t pa,
 	KASSERT(va < VM_MAXUSER_ADDRESS, ("wrong address space"));
 
 	va = trunc_page(va);
+	/*
+	 * IOMMU DMA mappings point at RAM, not MMIO.  Linux maps non-coherent
+	 * DMA as Normal Non-Cacheable and reserves Device attributes for MMIO
+	 * such as MSI doorbells.  Using Device for all PCIe DMA can serialize
+	 * the path heavily on non-coherent ARM systems.
+	 */
 	new_l3 = (pt_entry_t)(pa | ATTR_DEFAULT |
-	    ATTR_S1_IDX(VM_MEMATTR_DEVICE) | IOMMU_L3_PAGE);
+	    ATTR_S1_IDX(memattr) | IOMMU_L3_PAGE);
 	if ((prot & VM_PROT_WRITE) == 0)
 		new_l3 |= ATTR_S1_AP(ATTR_S1_AP_RO);
 	new_l3 |= ATTR_S1_XN; /* Execute never. */
@@ -743,6 +756,7 @@ retry:
 
 	/* New mapping */
 	smmu_pmap_store(l3, new_l3);
+	cpu_dcache_wb_range((vm_offset_t)l3, sizeof(pt_entry_t));
 	smmu_pmap_resident_count_inc(pmap, 1);
 	dsb(ishst);
 
@@ -772,6 +786,7 @@ smmu_pmap_remove(struct smmu_pmap *pmap, vm_offset_t va)
 	if (pte != NULL) {
 		smmu_pmap_resident_count_dec(pmap, 1);
 		smmu_pmap_clear(pte);
+		cpu_dcache_wb_range((vm_offset_t)pte, sizeof(pt_entry_t));
 		rc = KERN_SUCCESS;
 	} else
 		rc = KERN_FAILURE;

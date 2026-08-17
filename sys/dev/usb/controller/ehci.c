@@ -223,6 +223,17 @@ ehci_hcreset(ehci_softc_t *sc)
 	return (ehci_reset(sc));
 }
 
+static void
+ehci_init_barrier(ehci_softc_t *sc, bus_size_t reg)
+{
+
+	if ((sc->sc_init_quirks & EHCI_INITQ_MMIO_BARRIER) == 0)
+		return;
+
+	bus_space_barrier(sc->sc_io_tag, sc->sc_io_hdl, sc->sc_offs + reg,
+	    4, BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
+}
+
 static int
 ehci_init_sub(struct ehci_softc *sc)
 {
@@ -240,27 +251,35 @@ ehci_init_sub(struct ehci_softc *sc)
 
 		/* MUST clear segment register if 64 bit capable */
 		EOWRITE4(sc, EHCI_CTRLDSSEGMENT, 0);
+		ehci_init_barrier(sc, EHCI_CTRLDSSEGMENT);
 	}
 
 	usbd_get_page(&sc->sc_hw.pframes_pc, 0, &buf_res);
 	EOWRITE4(sc, EHCI_PERIODICLISTBASE, buf_res.physaddr);
+	ehci_init_barrier(sc, EHCI_PERIODICLISTBASE);
 
 	usbd_get_page(&sc->sc_hw.async_start_pc, 0, &buf_res);
 	EOWRITE4(sc, EHCI_ASYNCLISTADDR, buf_res.physaddr | EHCI_LINK_QH);
+	ehci_init_barrier(sc, EHCI_ASYNCLISTADDR);
 
-	/* enable interrupts */
-	EOWRITE4(sc, EHCI_USBINTR, sc->sc_eintrs);
+	if ((sc->sc_init_quirks & EHCI_INITQ_INTR_AFTER_RUN) == 0) {
+		/* enable interrupts */
+		EOWRITE4(sc, EHCI_USBINTR, sc->sc_eintrs);
+	}
 
 	/* turn on controller */
 	EOWRITE4(sc, EHCI_USBCMD,
-	    EHCI_CMD_ITC_1 |		/* 1 microframes interrupt delay */
+	    ((sc->sc_init_quirks & EHCI_INITQ_ITC_2) != 0 ?
+	    EHCI_CMD_ITC_2 : EHCI_CMD_ITC_1) |
 	    (EOREAD4(sc, EHCI_USBCMD) & EHCI_CMD_FLS_M) |
 	    EHCI_CMD_ASE |
 	    EHCI_CMD_PSE |
 	    EHCI_CMD_RS);
+	ehci_init_barrier(sc, EHCI_USBCMD);
 
 	/* Take over port ownership */
 	EOWRITE4(sc, EHCI_CONFIGFLAG, EHCI_CONF_CF);
+	ehci_init_barrier(sc, EHCI_CONFIGFLAG);
 
 	for (i = 0; i < 100; i++) {
 		usb_pause_mtx(NULL, hz / 128);
@@ -273,6 +292,9 @@ ehci_init_sub(struct ehci_softc *sc)
 		device_printf(sc->sc_bus.bdev, "run timeout\n");
 		return (USB_ERR_IOERROR);
 	}
+	if ((sc->sc_init_quirks & EHCI_INITQ_INTR_AFTER_RUN) != 0)
+		EOWRITE4(sc, EHCI_USBINTR, sc->sc_eintrs);
+	ehci_init_barrier(sc, EHCI_USBINTR);
 	return (USB_ERR_NORMAL_COMPLETION);
 }
 
@@ -482,14 +504,26 @@ ehci_init(ehci_softc_t *sc)
 
 		pframes = buf_res.buffer;
 
-		/*
-		 * execution order:
-		 * pframes -> high speed isochronous ->
-		 *    full speed isochronous -> interrupt QH's
-		 */
-		for (i = 0; i < EHCI_FRAMELIST_COUNT; i++) {
-			pframes[i] = sc->sc_isoc_hs_p_last
-			    [i & (EHCI_VIRTUAL_FRAMELIST_COUNT - 1)]->itd_self;
+		if ((sc->sc_init_quirks &
+		    EHCI_INITQ_INTR_QH_FRAMELIST) != 0) {
+			/*
+			 * Point the periodic frame list directly at the
+			 * interrupt QH tree, without ITD/SITD entries.
+			 */
+			for (i = 0; i < EHCI_FRAMELIST_COUNT; i++) {
+				pframes[i] = sc->sc_intr_p_last
+				    [i & (EHCI_VIRTUAL_FRAMELIST_COUNT - 1)]->qh_self;
+			}
+		} else {
+			/*
+			 * execution order:
+			 * pframes -> high speed isochronous ->
+			 *    full speed isochronous -> interrupt QH's
+			 */
+			for (i = 0; i < EHCI_FRAMELIST_COUNT; i++) {
+				pframes[i] = sc->sc_isoc_hs_p_last
+				    [i & (EHCI_VIRTUAL_FRAMELIST_COUNT - 1)]->itd_self;
+			}
 		}
 	}
 	usbd_get_page(&sc->sc_hw.async_start_pc, 0, &buf_res);
@@ -1922,8 +1956,11 @@ ehci_setup_standard_chain(struct usb_xfer *xfer, ehci_qh_t **qh_last)
 
 	if (usbd_get_speed(xfer->xroot->udev) == USB_SPEED_HIGH) {
 		qh_endp |= EHCI_QH_SET_EPS(EHCI_QH_SPEED_HIGH);
-		if (methods != &ehci_device_intr_methods)
-			qh_endp |= EHCI_QH_SET_NRL(8);
+		if (methods != &ehci_device_intr_methods) {
+			qh_endp |= EHCI_QH_SET_NRL(
+			    (temp.sc->sc_init_quirks & EHCI_INITQ_NRL_4) != 0 ?
+			    4 : 8);
+		}
 	} else {
 		if (usbd_get_speed(xfer->xroot->udev) == USB_SPEED_FULL) {
 			qh_endp |= EHCI_QH_SET_EPS(EHCI_QH_SPEED_FULL);

@@ -25,6 +25,7 @@
  */
 
 #include "opt_kern_tls.h"
+#include "opt_mlx5.h"
 #include "opt_rss.h"
 #include "opt_ratelimit.h"
 
@@ -35,6 +36,12 @@
 #include <machine/atomic.h>
 
 #include <net/debugnet.h>
+
+#ifdef MLX5E_RX_MAPPED_SLOTS
+#define	MLX5E_RQ_DMA_MAPS MLX5E_RQ_MBUF_SLOTS
+#else
+#define	MLX5E_RQ_DMA_MAPS 1
+#endif
 
 static int mlx5e_get_wqe_sz(struct mlx5e_priv *priv, u32 *wqe_sz, u32 *nsegs);
 static if_snd_tag_query_t mlx5e_ul_snd_tag_query;
@@ -1197,6 +1204,7 @@ mlx5e_create_rq(struct mlx5e_channel *c,
 	int wq_sz;
 	int err;
 	int i;
+	int j;
 	u32 nsegs, wqe_sz;
 
 	err = mlx5e_get_wqe_sz(priv, &wqe_sz, &nsegs);
@@ -1240,13 +1248,12 @@ mlx5e_create_rq(struct mlx5e_channel *c,
 	    mlx5_dev_domainset(mdev), M_WAITOK | M_ZERO);
 	for (i = 0; i != wq_sz; i++) {
 		struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(&rq->wq, i);
-		int j;
 
-		err = -bus_dmamap_create(rq->dma_tag, 0, &rq->mbuf[i].dma_map);
-		if (err != 0) {
-			while (i--)
-				bus_dmamap_destroy(rq->dma_tag, rq->mbuf[i].dma_map);
-			goto err_rq_mbuf_free;
+		for (j = 0; j != MLX5E_RQ_DMA_MAPS; j++) {
+			err = -bus_dmamap_create(rq->dma_tag, 0,
+			    &rq->mbuf[i].slot[j].dma_map);
+			if (err != 0)
+				goto err_rq_mbuf_maps_free;
 		}
 
 		/* set value for constant fields */
@@ -1284,7 +1291,14 @@ mlx5e_create_rq(struct mlx5e_channel *c,
 	    rq->stats.arg);
 	return (0);
 
-err_rq_mbuf_free:
+err_rq_mbuf_maps_free:
+	for (; i >= 0; i--) {
+		for (j = 0; j != MLX5E_RQ_MBUF_SLOTS; j++) {
+			if (rq->mbuf[i].slot[j].dma_map != NULL)
+				bus_dmamap_destroy(rq->dma_tag,
+				    rq->mbuf[i].slot[j].dma_map);
+		}
+	}
 	free(rq->mbuf, M_MLX5EN);
 	tcp_lro_free(&rq->lro);
 err_rq_wq_destroy:
@@ -1309,11 +1323,16 @@ mlx5e_destroy_rq(struct mlx5e_rq *rq)
 
 	wq_sz = mlx5_wq_ll_get_size(&rq->wq);
 	for (i = 0; i != wq_sz; i++) {
-		if (rq->mbuf[i].mbuf != NULL) {
-			bus_dmamap_unload(rq->dma_tag, rq->mbuf[i].dma_map);
-			m_freem(rq->mbuf[i].mbuf);
+		for (int j = 0; j != MLX5E_RQ_MBUF_SLOTS; j++) {
+			if (rq->mbuf[i].slot[j].mbuf != NULL) {
+				bus_dmamap_unload(rq->dma_tag,
+				    rq->mbuf[i].slot[j].dma_map);
+				m_freem(rq->mbuf[i].slot[j].mbuf);
+			}
+			if (rq->mbuf[i].slot[j].dma_map != NULL)
+				bus_dmamap_destroy(rq->dma_tag,
+				    rq->mbuf[i].slot[j].dma_map);
 		}
-		bus_dmamap_destroy(rq->dma_tag, rq->mbuf[i].dma_map);
 	}
 	free(rq->mbuf, M_MLX5EN);
 	mlx5_wq_destroy(&rq->wq_ctrl);

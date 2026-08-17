@@ -59,6 +59,7 @@
 #define	 SDMMC_INTMASK_HLE	(1 << 12)	/* Hardware locked write err */
 #define	 SDMMC_INTMASK_FRUN	(1 << 11)	/* FIFO underrun/overrun err */
 #define	 SDMMC_INTMASK_HTO	(1 << 10)	/* Data starvation by host timeout */
+#define	 SDMMC_INTMASK_VOLT_SWITCH (1 << 10)	/* CMD11 voltage switch */
 #define	 SDMMC_INTMASK_DRT	(1 << 9)	/* Data read timeout  */
 #define	 SDMMC_INTMASK_RTO	(1 << 8)	/* Response timeout */
 #define	 SDMMC_INTMASK_DCRC	(1 << 7)	/* Data CRC error */
@@ -73,6 +74,7 @@
 #define	SDMMC_CMD		0x2C	/* Command Register */
 #define	 SDMMC_CMD_START	(1 << 31)
 #define	 SDMMC_CMD_USE_HOLD_REG	(1 << 29)
+#define	 SDMMC_CMD_VOLT_SWITCH	(1 << 28)
 #define	 SDMMC_CMD_UPD_CLK_ONLY	(1 << 21)	/* Update clk only */
 #define	 SDMMC_CMD_SEND_INIT	(1 << 15)	/* Send initialization */
 #define	 SDMMC_CMD_STOP_ABORT	(1 << 14)	/* stop current data transfer */
@@ -107,6 +109,7 @@
 #define	SDMMC_VERID		0x6C	/* Version ID Register */
 #define	SDMMC_HCON		0x70	/* Hardware Configuration Register */
 #define	SDMMC_UHS_REG		0x74	/* UHS-1 Register */
+#define	 SDMMC_UHS_REG_18V	(1 << 0) /* 1.8 V signaling */
 #define	 SDMMC_UHS_REG_DDR	(1 << 16) /* DDR mode */
 #define	SDMMC_RST_N		0x78	/* Hardware Reset Register */
 #define	SDMMC_BMOD		0x80	/* Bus Mode Register */

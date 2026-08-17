@@ -194,7 +194,8 @@ usb_process(void *arg)
  * execute callbacks. The mutex pointed to by "p_mtx" will be applied
  * before calling the callbacks and released after that the callback
  * has returned. The structure pointed to by "up" is assumed to be
- * zeroed before this function is called.
+ * zeroed before this function is called, or have been released by
+ * usb_proc_free() with an empty command queue.
  *
  * Return values:
  *    0: success
@@ -204,6 +205,18 @@ int
 usb_proc_create(struct usb_process *up, struct mtx *p_mtx,
     const char *pmesg, uint8_t prio)
 {
+	if (up->up_mtx != NULL || up->up_ptr != NULL ||
+	    !TAILQ_EMPTY(&up->up_qhead))
+		return (EBUSY);
+
+	/* Allow a process that was released by usb_proc_free() to be reused. */
+	up->up_ptr = NULL;
+	up->up_curtd = NULL;
+	up->up_msg_num = 0;
+	up->up_gone = 0;
+	up->up_msleep = 0;
+	up->up_csleep = 0;
+	up->up_dsleep = 0;
 	up->up_mtx = p_mtx;
 	up->up_prio = prio;
 

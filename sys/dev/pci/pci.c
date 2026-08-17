@@ -68,6 +68,7 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pci_private.h>
+#include <dev/pci/pci_soc.h>
 
 #ifdef PCI_IOV
 #include <sys/nv.h>
@@ -3362,11 +3363,13 @@ pci_add_map(device_t bus, device_t dev, int reg, struct resource_list *rl,
 	 * areas to the type of memory involved.  Memory must be at least
 	 * 16 bytes in size, while I/O ranges must be at least 4.
 	 */
-	if (PCI_BAR_IO(testval) && (testval & PCIM_BAR_IO_RESERVED) != 0)
+	if (PCI_BAR_IO(testval) && (testval & PCIM_BAR_IO_RESERVED) != 0) {
 		return (barlen);
+	}
 	if ((type == SYS_RES_MEMORY && mapsize < 4) ||
-	    (type == SYS_RES_IOPORT && mapsize < 2))
+	    (type == SYS_RES_IOPORT && mapsize < 2)) {
 		return (barlen);
+	}
 
 	/* Save a record of this BAR. */
 	pm = pci_add_bar(dev, reg, map, mapsize);
@@ -3392,8 +3395,9 @@ pci_add_map(device_t bus, device_t dev, int reg, struct resource_list *rl,
 	 * read back.  These maps have had all f's written to them by the
 	 * BIOS in an attempt to disable the resources.
 	 */
-	if (!force && (basezero || map == testval))
+	if (!force && (basezero || map == testval)) {
 		return (barlen);
+	}
 	if ((u_long)base != base) {
 		device_printf(bus,
 		    "pci%d:%d:%d:%d bar %#x too many address bits",
@@ -4523,6 +4527,7 @@ void
 pci_child_added_method(device_t dev, device_t child)
 {
 
+	pci_soc_child_added(child);
 }
 
 static int

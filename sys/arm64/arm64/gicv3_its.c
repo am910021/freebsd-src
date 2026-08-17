@@ -67,6 +67,7 @@
 #include <arm/arm/gic_common.h>
 #include <arm64/arm64/gic_v3_reg.h>
 #include <arm64/arm64/gic_v3_var.h>
+#include <arm64/arm64/gicv3_its_soc.h>
 
 #ifdef FDT
 #include <dev/ofw/openfirm.h>
@@ -285,10 +286,12 @@ struct gicv3_its_softc {
 	TAILQ_HEAD(its_dev_list, its_dev) sc_its_dev_list;
 	TAILQ_HEAD(free_irqs, gicv3_its_irqsrc) sc_free_irqs;
 
-#define	ITS_FLAGS_CMDQ_FLUSH		0x00000001
-#define	ITS_FLAGS_LPI_CONF_FLUSH	0x00000002
-#define	ITS_FLAGS_ERRATA_CAVIUM_22375	0x00000004
-#define	ITS_FLAGS_LPI_PREALLOC		0x00000008
+#define	ITS_FLAGS_CMDQ_FLUSH		GICV3_ITS_SOC_FLAG_CMDQ_FLUSH
+#define	ITS_FLAGS_LPI_CONF_FLUSH	GICV3_ITS_SOC_FLAG_LPI_CONF_FLUSH
+#define	ITS_FLAGS_ERRATA_CAVIUM_22375	GICV3_ITS_SOC_FLAG_ERRATA_CAVIUM_22375
+#define	ITS_FLAGS_LPI_PREALLOC		GICV3_ITS_SOC_FLAG_LPI_PREALLOC
+#define	ITS_FLAGS_FORCE_CACHE_FLUSH	GICV3_ITS_SOC_FLAG_FORCE_CACHE_FLUSH
+#define	ITS_FLAGS_FORCE_NOSHAREABLE	GICV3_ITS_SOC_FLAG_FORCE_NOSHAREABLE
 	u_int sc_its_flags;
 	bool	trace_enable;
 	vm_page_t ma; /* fake msi page */
@@ -400,14 +403,20 @@ gicv3_its_cmdq_init(struct gicv3_its_softc *sc)
 	    sc->sc_ds, M_WAITOK | M_ZERO, 0, (1ul << 48) - 1, ITS_CMDQ_ALIGN,
 	    0);
 	sc->sc_its_cmd_next_idx = 0;
+	if ((sc->sc_its_flags & ITS_FLAGS_FORCE_CACHE_FLUSH) != 0)
+		cpu_dcache_wb_range((vm_offset_t)sc->sc_its_cmd_base,
+		    ITS_CMDQ_SIZE);
 
 	cmd_paddr = vtophys(sc->sc_its_cmd_base);
 
 	/* Set the base of the command buffer */
 	reg = GITS_CBASER_VALID |
 	    (GITS_CBASER_CACHE_NIWAWB << GITS_CBASER_CACHE_SHIFT) |
-	    cmd_paddr | (GITS_CBASER_SHARE_IS << GITS_CBASER_SHARE_SHIFT) |
-	    (ITS_CMDQ_SIZE / 4096 - 1);
+	    cmd_paddr | (ITS_CMDQ_SIZE / 4096 - 1);
+	if ((sc->sc_its_flags & ITS_FLAGS_FORCE_NOSHAREABLE) != 0)
+		reg |= GITS_CBASER_SHARE_NS << GITS_CBASER_SHARE_SHIFT;
+	else
+		reg |= GITS_CBASER_SHARE_IS << GITS_CBASER_SHARE_SHIFT;
 	gic_its_write_8(sc, GITS_CBASER, reg);
 
 	/* Read back to check for fixed value fields */
@@ -534,10 +543,16 @@ gicv3_its_table_init(device_t dev, struct gicv3_its_softc *sc)
 		cache = 0;
 	} else {
 		devbits = GITS_TYPER_DEVB(gic_its_read_8(sc, GITS_TYPER));
-		cache = GITS_BASER_CACHE_WAWB;
+		if ((sc->sc_its_flags & ITS_FLAGS_FORCE_NOSHAREABLE) != 0)
+			cache = GITS_BASER_CACHE_NC;
+		else
+			cache = GITS_BASER_CACHE_WAWB;
 	}
 	sc->sc_devbits = devbits;
-	share = GITS_BASER_SHARE_IS;
+	if ((sc->sc_its_flags & ITS_FLAGS_FORCE_NOSHAREABLE) != 0)
+		share = GITS_BASER_SHARE_NS;
+	else
+		share = GITS_BASER_SHARE_IS;
 
 	for (i = 0; i < GITS_BASER_NUM; i++) {
 		reg = gic_its_read_8(sc, GITS_BASER(i));
@@ -605,6 +620,8 @@ gicv3_its_table_init(device_t dev, struct gicv3_its_softc *sc)
 		table = (vm_offset_t)contigmalloc_domainset(npages * PAGE_SIZE,
 		    M_GICV3_ITS, sc->sc_ds, M_WAITOK | M_ZERO, 0,
 		    (1ul << 48) - 1, PAGE_SIZE_64K, 0);
+		if ((sc->sc_its_flags & ITS_FLAGS_FORCE_CACHE_FLUSH) != 0)
+			cpu_dcache_wb_range(table, npages * PAGE_SIZE);
 
 		sc->sc_its_ptab[i].ptab_vaddr = table;
 		sc->sc_its_ptab[i].ptab_l1_size = its_tbl_size;
@@ -798,9 +815,14 @@ its_init_cpu_lpi(device_t dev, struct gicv3_its_softc *sc)
 		size = (flsl(LPI_CONFTAB_SIZE | GIC_FIRST_LPI) - 1);
 
 		xbaser = vtophys(sc->sc_conf_base) |
-		    (GICR_PROPBASER_SHARE_IS << GICR_PROPBASER_SHARE_SHIFT) |
 		    (GICR_PROPBASER_CACHE_NIWAWB << GICR_PROPBASER_CACHE_SHIFT) |
 		    size;
+		if ((sc->sc_its_flags & ITS_FLAGS_FORCE_NOSHAREABLE) != 0)
+			xbaser |= GICR_PROPBASER_SHARE_NS <<
+			    GICR_PROPBASER_SHARE_SHIFT;
+		else
+			xbaser |= GICR_PROPBASER_SHARE_IS <<
+			    GICR_PROPBASER_SHARE_SHIFT;
 
 		gic_r_write_8(gicv3, GICR_PROPBASER, xbaser);
 
@@ -829,8 +851,13 @@ its_init_cpu_lpi(device_t dev, struct gicv3_its_softc *sc)
 		 * Set the LPI pending table base
 		 */
 		xbaser = vtophys(sc->sc_pend_base[cpuid]) |
-		    (GICR_PENDBASER_CACHE_NIWAWB << GICR_PENDBASER_CACHE_SHIFT) |
-		    (GICR_PENDBASER_SHARE_IS << GICR_PENDBASER_SHARE_SHIFT);
+		    (GICR_PENDBASER_CACHE_NIWAWB << GICR_PENDBASER_CACHE_SHIFT);
+		if ((sc->sc_its_flags & ITS_FLAGS_FORCE_NOSHAREABLE) != 0)
+			xbaser |= GICR_PENDBASER_SHARE_NS <<
+			    GICR_PENDBASER_SHARE_SHIFT;
+		else
+			xbaser |= GICR_PENDBASER_SHARE_IS <<
+			    GICR_PENDBASER_SHARE_SHIFT;
 
 		gic_r_write_8(gicv3, GICR_PENDBASER, xbaser);
 
@@ -1023,7 +1050,7 @@ gicv3_its_attach(device_t dev)
 	phys = rounddown2(vtophys(rman_get_virtual(sc->sc_its_res)) +
 	    GITS_TRANSLATER, PAGE_SIZE);
 	sc->ma = malloc(sizeof(struct vm_page), M_DEVBUF, M_WAITOK | M_ZERO);
-	vm_page_initfake(sc->ma, phys, VM_MEMATTR_DEFAULT);
+	vm_page_initfake(sc->ma, phys, VM_MEMATTR_DEVICE);
 
 	CPU_COPY(&all_cpus, &sc->sc_cpus);
 	iidr = gic_its_read_4(sc, GITS_IIDR);
@@ -1037,6 +1064,8 @@ gicv3_its_attach(device_t dev)
 			break;
 		}
 	}
+
+	gicv3_its_soc_apply_quirks(dev, &sc->sc_its_flags);
 
 	if (bus_get_domain(dev, &domain) == 0 && domain < MAXMEMDOM) {
 		sc->sc_ds = DOMAINSET_PREF(domain);
@@ -1239,11 +1268,13 @@ static int
 gicv3_its_select_cpu(device_t dev, struct intr_irqsrc *isrc)
 {
 	struct gicv3_its_softc *sc;
+	cpuset_t cpus;
 
 	sc = device_get_softc(dev);
 	if (CPU_EMPTY(&isrc->isrc_cpu)) {
+		gicv3_its_soc_select_cpus(dev, &sc->sc_cpus, &cpus);
 		sc->gic_irq_cpu = intr_irq_next_cpu(sc->gic_irq_cpu,
-		    &sc->sc_cpus);
+		    &cpus);
 		CPU_SETOF(sc->gic_irq_cpu, &isrc->isrc_cpu);
 	}
 
@@ -1397,12 +1428,14 @@ its_device_alloc(struct gicv3_its_softc *sc, int devid)
 	    M_GICV3_ITS, sc->sc_ds, M_WAITOK | M_ZERO, 0, (1ul << 48) - 1,
 	    ptable->ptab_page_size, 0);
 
-	if (!shareable)
+	if (!shareable ||
+	    (sc->sc_its_flags & ITS_FLAGS_FORCE_CACHE_FLUSH) != 0)
 		cpu_dcache_wb_range((vm_offset_t)l2_table,
 		    ptable->ptab_l2_size);
 
 	table[index] = vtophys(l2_table) | GITS_BASER_VALID;
-	if (!shareable)
+	if (!shareable ||
+	    (sc->sc_its_flags & ITS_FLAGS_FORCE_CACHE_FLUSH) != 0)
 		cpu_dcache_wb_range((vm_offset_t)&table[index],
 		    sizeof(table[index]));
 
@@ -1555,7 +1588,8 @@ gicv3_its_release_irqsrc(struct gicv3_its_softc *sc,
 }
 
 static int
-gicv3_its_alloc_msi(device_t dev, device_t child, int count, int maxcount,
+gicv3_its_alloc_msi(device_t dev, device_t child, int count,
+    int maxcount __unused,
     device_t *pic, struct intr_irqsrc **srcs)
 {
 	struct gicv3_its_softc *sc;
@@ -1716,7 +1750,8 @@ gicv3_its_release_msix(device_t dev, device_t child, struct intr_irqsrc *isrc)
 }
 
 static int
-gicv3_its_map_msi(device_t dev, device_t child, struct intr_irqsrc *isrc,
+gicv3_its_map_msi(device_t dev, device_t child __unused,
+    struct intr_irqsrc *isrc,
     uint64_t *addr, uint32_t *data)
 {
 	struct gicv3_its_softc *sc;
@@ -1740,9 +1775,12 @@ gicv3_iommu_init(device_t dev, device_t child, struct iommu_domain **domain)
 	int error;
 
 	sc = device_get_softc(dev);
+	/* No context means the device is not behind an IOMMU. */
 	ctx = iommu_get_dev_ctx(child);
-	if (ctx == NULL)
-		return (ENXIO);
+	if (ctx == NULL) {
+		*domain = NULL;
+		return (0);
+	}
 	/* Map the page containing the GITS_TRANSLATER register. */
 	error = iommu_map_msi(ctx, PAGE_SIZE, 0,
 	    IOMMU_MAP_ENTRY_WRITE, IOMMU_MF_CANWAIT, &sc->ma);

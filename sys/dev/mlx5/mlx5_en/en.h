@@ -607,6 +607,8 @@ struct mlx5e_port_stats_debug {
   m(+1, u64, lro_bytes, "lro_bytes", "Received LRO bytes")	\
   m(+1, u64, sw_lro_queued, "sw_lro_queued", "Packets queued for SW LRO")	\
   m(+1, u64, sw_lro_flushed, "sw_lro_flushed", "Packets flushed from SW LRO")	\
+  m(+1, u64, mapped_shadow, "mapped_shadow", "Mapped RX buffer shadows") \
+  m(+1, u64, mapped_copy, "mapped_copy", "Mapped RX buffer copies") \
   m(+1, u64, wqe_err, "wqe_err", "Received packets") \
   m(+1, u64, decrypted_ok_packets, "decrypted_ok_packets", "Received packets successfully decrypted by steering rule(s)") \
   m(+1, u64, decrypted_error_packets, "decrypted_error_packets", "Received packets not decrypted by steering rule(s)")
@@ -746,10 +748,19 @@ struct mlx5e_cq {
 	struct mlx5_wq_ctrl wq_ctrl;
 } __aligned(MLX5E_CACHELINE_SIZE);
 
-struct mlx5e_rq_mbuf {
+struct mlx5e_rq_mbuf_slot {
 	bus_dmamap_t	dma_map;
 	caddr_t		data;
 	struct mbuf	*mbuf;
+	bus_dma_segment_t segs[MLX5E_MAX_BUSDMA_RX_SEGS];
+	int		nsegs;
+};
+
+#define	MLX5E_RQ_MBUF_SLOTS 2
+
+struct mlx5e_rq_mbuf {
+	struct mlx5e_rq_mbuf_slot slot[MLX5E_RQ_MBUF_SLOTS];
+	u8		active;
 };
 
 struct mlx5e_rq {
