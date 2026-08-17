@@ -106,7 +106,6 @@
 #define VOP2_VP0_DSP_CTRL		0xc00
 #define  VOP2_VP0_OUT_MODE_MASK		0xfu
 #define  VOP2_VP0_OUT_MODE_RGB888	0u
-#define  VOP2_VP0_OUT_MODE_AAAA		0xfu
 #define  VOP2_VP0_STANDBY		(1u << 31)
 #define VOP2_VP0_COLOR_BAR_CTRL		0xc08
 #define  VOP2_VP0_COLOR_BAR_HORIZONTAL	1u
@@ -1320,12 +1319,6 @@ rk3588_vop2_get_mode(struct rk3588_vop2_softc *sc)
 static int
 rk3588_vop2_fb_alloc(struct rk3588_vop2_softc *sc)
 {
-	static const uint32_t colors[] = {
-		0xffffffff, 0xffffff00, 0xff00ffff, 0xff00ff00,
-		0xffff00ff, 0xffff0000, 0xff0000ff, 0xff000000
-	};
-	uint32_t *pixels;
-	unsigned int x, y;
 	int error;
 
 	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), PAGE_SIZE, 0,
@@ -1350,11 +1343,6 @@ rk3588_vop2_fb_alloc(struct rk3588_vop2_softc *sc)
 	if (error != 0)
 		goto fail_mem;
 
-	pixels = sc->fb_vaddr;
-	for (y = 0; y < sc->fb_height; y++)
-		for (x = 0; x < sc->fb_width; x++)
-			pixels[y * (sc->fb_stride / sizeof(*pixels)) + x] =
-			    colors[x * nitems(colors) / sc->fb_width];
 	bus_dmamap_sync(sc->fb_tag, sc->fb_map, BUS_DMASYNC_PREWRITE);
 	return (0);
 
@@ -1681,7 +1669,7 @@ rk3588_vop2_program(struct rk3588_vop2_softc *sc)
 	bus_write_4(sc->mem, VOP2_CLUSTER0_WIN0_CTRL0,
 	    VOP2_CLUSTER0_WIN0_ENABLE);
 	bus_write_4(sc->mem, VOP2_CLUSTER0_CTRL, VOP2_CLUSTER0_ENABLE);
-	rk3588_vop2_mod(sc, VOP2_VP0_DSP_CTRL, VOP2_VP0_OUT_MODE_AAAA,
+	rk3588_vop2_mod(sc, VOP2_VP0_DSP_CTRL, VOP2_VP0_OUT_MODE_RGB888,
 	    VOP2_VP0_OUT_MODE_MASK);
 
 	sc->program_stage = "clear-fs-1";
@@ -1779,7 +1767,7 @@ rk3588_vop2_program(struct rk3588_vop2_softc *sc)
 	    (sc->if_pol_after & (VOP2_HDMI_DCLK_POL |
 	    VOP2_HDMI_PIN_POL_MASK)) != (VOP2_HDMI_DCLK_POL | (pol << 4)) ||
 	    (sc->dsp_ctrl_after & (VOP2_VP0_STANDBY |
-	    VOP2_VP0_OUT_MODE_MASK)) != VOP2_VP0_OUT_MODE_AAAA ||
+	    VOP2_VP0_OUT_MODE_MASK)) != VOP2_VP0_OUT_MODE_RGB888 ||
 	    sc->bg_after != VOP2_VP0_BG_LINUX ||
 	    (sc->color_bar_after & VOP2_VP0_COLOR_BAR_HORIZONTAL) != 0 ||
 	    (sc->ovl_ctrl_after & (VOP2_OVL_VP0_YUV |
