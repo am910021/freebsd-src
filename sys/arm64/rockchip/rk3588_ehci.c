@@ -69,6 +69,8 @@
 #include <dev/usb/controller/generic_ehci.h>
 
 #define	RK3588_EHCI_RETRY_SCHEDULED	0x00000001
+#define	RK3588_EHCI_NCLOCKS		4
+#define	RK3588_EHCI_NPHYS		1
 
 #define	RK3588_EHCI_USBINTR	0x08
 
@@ -184,19 +186,31 @@ rk3588_ehci_enable_phys(device_t dev)
 	struct rk3588_ehci_softc *sc;
 	struct phy_list *phyp;
 	phy_t phy;
-	int err, off;
+	int count, err, off;
 
 	sc = device_get_softc(dev);
+	err = ofw_bus_parse_xref_list_get_length(ofw_bus_get_node(dev),
+	    "phys", "#phy-cells", &count);
+	if (err != 0 || count != RK3588_EHCI_NPHYS) {
+		device_printf(dev, "Expected %d PHY, found %d\n",
+		    RK3588_EHCI_NPHYS, err == 0 ? count : 0);
+		return (err == 0 ? EINVAL : err);
+	}
 
-	for (off = 0; phy_get_by_ofw_idx(dev, 0, off, &phy) == 0; off++) {
+	for (off = 0; off < count; off++) {
+		err = phy_get_by_ofw_idx(dev, 0, off, &phy);
+		if (err != 0)
+			return (err);
 		err = phy_usb_set_mode(phy, PHY_USB_MODE_HOST);
 		if (err != 0) {
 			device_printf(dev, "Could not set phy to host mode\n");
+			phy_release(phy);
 			return (err);
 		}
 		err = phy_enable(phy);
 		if (err != 0) {
 			device_printf(dev, "Could not enable phy\n");
+			phy_release(phy);
 			return (err);
 		}
 		phyp = malloc(sizeof(*phyp), M_DEVBUF, M_WAITOK | M_ZERO);
@@ -240,6 +254,30 @@ rk3588_ehci_rk3588_openbsd_order_attach(device_t dev)
 	esc->sc_bus.devices = esc->sc_devices;
 	esc->sc_bus.devices_max = EHCI_MAX_DEVICES;
 	esc->sc_bus.dma_bits = 32;
+
+	/*
+	 * Finish the PHY side of the RK3588 host lifecycle before touching
+	 * controller MMIO.  A failed PHY attach otherwise leaves the shared
+	 * EHCI/OHCI block in a state that can hang the companion OHCI attach.
+	 */
+	err = rk3588_ehci_enable_phys(dev);
+	if (err != 0) {
+		rk3588_ehci_rk3588_schedule_retry(dev, "phy-enable", err);
+		return (err);
+	}
+
+	/*
+	 * OpenBSD's RK3588 rkusbphy host enable performs the PHY side
+	 * effects, then returns EINVAL, so ehci_init_phys() continues into
+	 * the "phys" fallback.  Keep FreeBSD's phynode_enable() success
+	 * semantics, but still run the same fallback boundary here.
+	 */
+	err = rk3588_ehci_rk3588_enable_phy_supplies(dev, true);
+	if (err != 0) {
+		rk3588_ehci_rk3588_schedule_retry(dev, "phys-fallback",
+		    err);
+		return (err);
+	}
 
 	if (usb_bus_mem_alloc_all(&esc->sc_bus, USB_GET_DMA_TAG(dev),
 	    &ehci_iterate_hw_softc))
@@ -290,25 +328,6 @@ rk3588_ehci_rk3588_openbsd_order_attach(device_t dev)
 		return (err);
 	}
 
-	err = rk3588_ehci_enable_phys(dev);
-	if (err != 0) {
-		rk3588_ehci_rk3588_schedule_retry(dev, "phy-enable", err);
-		return (err);
-	}
-
-	/*
-	 * OpenBSD's RK3588 rkusbphy host enable performs the PHY side
-	 * effects, then returns EINVAL, so ehci_init_phys() continues into
-	 * the "phys" fallback.  Keep FreeBSD's phynode_enable() success
-	 * semantics, but still run the same fallback boundary here.
-	 */
-	err = rk3588_ehci_rk3588_enable_phy_supplies(dev, true);
-	if (err != 0) {
-		rk3588_ehci_rk3588_schedule_retry(dev, "phys-fallback",
-		    err);
-		return (err);
-	}
-
 	esc->sc_init_quirks |= EHCI_INITQ_MMIO_BARRIER |
 	    EHCI_INITQ_INTR_AFTER_RUN |
 	    EHCI_INITQ_INTR_QH_FRAMELIST |
@@ -347,13 +366,14 @@ rk3588_ehci_attach(device_t dev)
 	clk_t clk;
 	struct hwrst_list *rstp;
 	hwreset_t rst;
-	int off;
+	int count, off;
 
 	sc = device_get_softc(dev);
 	if (ofw_bus_is_compatible(dev, "rockchip,rk3588-ehci"))
 		sc->rk3588_ehci_initialized = false;
 
 	TAILQ_INIT(&sc->clk_list);
+	TAILQ_INIT(&sc->rst_list);
 	TAILQ_INIT(&sc->phy_list);
 	if (ofw_bus_is_compatible(dev, "rockchip,rk3588-ehci")) {
 		err = rk3588_power_domain_enable_by_node(dev,
@@ -369,11 +389,27 @@ rk3588_ehci_attach(device_t dev)
 	}
 
 	/* Enable every clock declared by the DT, including usb480m_phy*. */
-	for (off = 0; clk_get_by_ofw_index(dev, 0, off, &clk) == 0; off++) {
+	err = ofw_bus_parse_xref_list_get_length(ofw_bus_get_node(dev),
+	    "clocks", "#clock-cells", &count);
+	if (err != 0 || count != RK3588_EHCI_NCLOCKS) {
+		device_printf(dev, "Expected %d clocks, found %d\n",
+		    RK3588_EHCI_NCLOCKS, err == 0 ? count : 0);
+		if (err == 0)
+			err = EINVAL;
+		goto error;
+	}
+	for (off = 0; off < count; off++) {
+		err = clk_get_by_ofw_index(dev, 0, off, &clk);
+		if (err != 0) {
+			device_printf(dev, "Could not get clock %d: %d\n",
+			    off, err);
+			goto error;
+		}
 		err = clk_enable(clk);
 		if (err != 0) {
 			device_printf(dev, "Could not enable clock %s\n",
 			    clk_get_name(clk));
+			clk_release(clk);
 			goto error;
 		}
 		clkp = malloc(sizeof(*clkp), M_DEVBUF, M_WAITOK | M_ZERO);
@@ -381,11 +417,20 @@ rk3588_ehci_attach(device_t dev)
 		TAILQ_INSERT_TAIL(&sc->clk_list, clkp, next);
 	}
 	/* De-assert reset */
-	TAILQ_INIT(&sc->rst_list);
-	for (off = 0; hwreset_get_by_ofw_idx(dev, 0, off, &rst) == 0; off++) {
+	err = ofw_bus_parse_xref_list_get_length(ofw_bus_get_node(dev),
+	    "resets", "#reset-cells", &count);
+	if (err == ENOENT)
+		count = 0;
+	else if (err != 0)
+		goto error;
+	for (off = 0; off < count; off++) {
+		err = hwreset_get_by_ofw_idx(dev, 0, off, &rst);
+		if (err != 0)
+			goto error;
 		err = hwreset_deassert(rst);
 		if (err != 0) {
 			device_printf(dev, "Could not de-assert reset\n");
+			hwreset_release(rst);
 			goto error;
 		}
 		rstp = malloc(sizeof(*rstp), M_DEVBUF, M_WAITOK | M_ZERO);
@@ -433,7 +478,8 @@ rk3588_ehci_detach(device_t dev)
 	esc = &sc->ehci_sc;
 
 	if (ofw_bus_is_compatible(dev, "rockchip,rk3588-ehci") &&
-	    esc->sc_io_res != NULL && !sc->rk3588_ehci_initialized) {
+	    !sc->rk3588_ehci_initialized) {
+		device_delete_children(dev);
 		if (esc->sc_intr_hdl != NULL) {
 			bus_teardown_intr(dev, esc->sc_irq_res,
 			    esc->sc_intr_hdl);
