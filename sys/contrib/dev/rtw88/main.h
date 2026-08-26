@@ -2069,6 +2069,7 @@ struct rtw_dev {
 
 	/* used to protect txqs list */
 	spinlock_t txq_lock;
+	struct mutex tx_work_mutex;
 	struct list_head txqs;
 	struct workqueue_struct *tx_wq;
 	struct work_struct tx_work;

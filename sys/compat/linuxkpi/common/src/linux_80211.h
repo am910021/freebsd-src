@@ -130,12 +130,22 @@ struct lkpi_radiotap_rx_hdr {
 
 struct lkpi_hw;
 
+int linuxkpi_ieee80211_start_tx_ba_session(struct ieee80211_sta *, uint8_t,
+    int);
+
+enum lkpi_txq_flags {
+	LKPI_TXQ_SEEN_DEQUEUE			= 0x01,
+	LKPI_TXQ_STOPPED			= 0x02,
+	LKPI_TXQ_STOPPED_BA			= 0x04,
+};
+#define	LKPI_TXQ_FLAGS_BITS						\
+    "\010\1SEEN_DEQUEUE\2STOPPED\3STOPPED_BA"
+
 struct lkpi_txq {
 	TAILQ_ENTRY(lkpi_txq)	txq_entry;
 
 	struct mtx		ltxq_mtx;
-	bool			seen_dequeue;
-	bool			stopped;
+	enum lkpi_txq_flags	flags;
 	uint32_t		txq_generation;
 	struct sk_buff_head	skbq;
 
@@ -221,12 +231,15 @@ struct lkpi_hw {	/* name it mac80211_sc? */
 
 	TAILQ_HEAD(, lkpi_vif)		lvif_head;
 	struct sx			lvif_sx;
+	struct lkpi_vif			*txq_lvif;
 
 	struct list_head		lchanctx_list;
 
 	struct mtx			txq_mtx;
 	uint32_t			txq_generation[IEEE80211_NUM_ACS];
-	TAILQ_HEAD(, lkpi_txq)		scheduled_txqs[IEEE80211_NUM_ACS];
+	spinlock_t			txq_scheduled_lock[IEEE80211_NUM_ACS];
+	TAILQ_HEAD(, lkpi_txq)		txq_scheduled[IEEE80211_NUM_ACS];
+	spinlock_t			txq_lock;
 
 	/* Deferred RX path. */
 	struct task		rxq_task;

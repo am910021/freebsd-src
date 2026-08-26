@@ -25,6 +25,11 @@
 #include "sdio.h"
 #include "led.h"
 
+#if defined(__FreeBSD__)
+int linuxkpi_ieee80211_start_tx_ba_session(struct ieee80211_sta *, uint8_t,
+    int);
+#endif
+
 bool rtw_disable_lps_deep_mode;
 EXPORT_SYMBOL(rtw_disable_lps_deep_mode);
 bool rtw_bf_support = true;
@@ -48,11 +53,11 @@ MODULE_PARM_DESC(support_bf, "Set Y to enable beamformee support");
 MODULE_PARM_DESC(debug_mask, "Debugging mask");
 
 #if defined(__FreeBSD__)
-static bool rtw_ht_support = false;
+static bool rtw_ht_support = true;
 module_param_named(support_ht, rtw_ht_support, bool, 0644);
 MODULE_PARM_DESC(support_ht, "Set to Y to enable HT support");
 
-static bool rtw_vht_support = false;
+static bool rtw_vht_support = true;
 module_param_named(support_vht, rtw_vht_support, bool, 0644);
 MODULE_PARM_DESC(support_vht, "Set to Y to enable VHT support");
 #endif
@@ -718,7 +723,11 @@ static void rtw_txq_ba_iter(void *data, struct ieee80211_sta *sta)
 	tid = find_first_bit(si->tid_ba, IEEE80211_NUM_TIDS);
 	while (tid != IEEE80211_NUM_TIDS) {
 		clear_bit(tid, si->tid_ba);
+#if defined(__FreeBSD__)
+		ret = linuxkpi_ieee80211_start_tx_ba_session(sta, tid, 0);
+#else
 		ret = ieee80211_start_tx_ba_session(sta, tid, 0);
+#endif
 		if (ret == -EINVAL) {
 			struct ieee80211_txq *txq;
 			struct rtw_txq *rtwtxq;
@@ -2189,6 +2198,7 @@ int rtw_core_init(struct rtw_dev *rtwdev)
 	spin_lock_init(&rtwdev->txq_lock);
 	spin_lock_init(&rtwdev->tx_report.q_lock);
 
+	mutex_init(&rtwdev->tx_work_mutex);
 	mutex_init(&rtwdev->mutex);
 	mutex_init(&rtwdev->hal.tx_power_mutex);
 
@@ -2265,6 +2275,7 @@ void rtw_core_deinit(struct rtw_dev *rtwdev)
 		kfree(rsvd_pkt);
 	}
 
+	mutex_destroy(&rtwdev->tx_work_mutex);
 	mutex_destroy(&rtwdev->mutex);
 	mutex_destroy(&rtwdev->hal.tx_power_mutex);
 }

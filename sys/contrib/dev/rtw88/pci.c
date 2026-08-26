@@ -423,11 +423,13 @@ static int rtw_pci_init(struct rtw_dev *rtwdev)
 			      IMR_BEDOK |
 			      IMR_VIDOK |
 			      IMR_VODOK |
+			      IMR_RDU |
 			      IMR_ROK |
 			      IMR_BCNDMAINT_E |
 			      IMR_C2HCMD |
 			      0;
 	rtwpci->irq_mask[1] = IMR_TXFOVW |
+			      IMR_RXFOVW |
 			      0;
 	rtwpci->irq_mask[3] = IMR_H2CDOK |
 			      0;
@@ -527,12 +529,13 @@ static void rtw_pci_enable_interrupt(struct rtw_dev *rtwdev,
 				     struct rtw_pci *rtwpci, bool exclude_rx)
 {
 	unsigned long flags;
-	u32 imr0_unmask = exclude_rx ? IMR_ROK : 0;
+	u32 imr0_unmask = exclude_rx ? IMR_ROK | IMR_RDU : 0;
+	u32 imr1_unmask = exclude_rx ? IMR_RXFOVW : 0;
 
 	spin_lock_irqsave(&rtwpci->hwirq_lock, flags);
 
 	rtw_write32(rtwdev, RTK_PCI_HIMR0, rtwpci->irq_mask[0] & ~imr0_unmask);
-	rtw_write32(rtwdev, RTK_PCI_HIMR1, rtwpci->irq_mask[1]);
+	rtw_write32(rtwdev, RTK_PCI_HIMR1, rtwpci->irq_mask[1] & ~imr1_unmask);
 	if (rtw_chip_wcpu_11ac(rtwdev))
 		rtw_write32(rtwdev, RTK_PCI_HIMR3, rtwpci->irq_mask[3]);
 
@@ -976,6 +979,8 @@ static int rtw_pci_tx_write(struct rtw_dev *rtwdev,
 	enum rtw_tx_queue_type queue = rtw_tx_queue_mapping(skb);
 	struct rtw_pci *rtwpci = (struct rtw_pci *)rtwdev->priv;
 	struct rtw_pci_tx_ring *ring;
+	bool stop_queue, wake_queue = false;
+	u16 q_map;
 	int ret;
 
 	ret = rtw_pci_tx_write_data(rtwdev, pkt_info, skb, queue);
@@ -983,18 +988,31 @@ static int rtw_pci_tx_write(struct rtw_dev *rtwdev,
 		return ret;
 
 	ring = &rtwpci->tx_rings[queue];
+	q_map = skb_get_queue_mapping(skb);
 	spin_lock_bh(&rtwpci->irq_lock);
-	if (avail_desc(ring->r.wp, ring->r.rp, ring->r.len) < 2) {
-		ieee80211_stop_queue(rtwdev->hw, skb_get_queue_mapping(skb));
-		ring->queue_stopped = true;
-	}
+	stop_queue = !ring->queue_stopped &&
+	    avail_desc(ring->r.wp, ring->r.rp, ring->r.len) < 2;
 	spin_unlock_bh(&rtwpci->irq_lock);
+
+	if (stop_queue) {
+		ieee80211_stop_queue(rtwdev->hw, q_map);
+
+		spin_lock_bh(&rtwpci->irq_lock);
+		if (avail_desc(ring->r.wp, ring->r.rp, ring->r.len) < 2)
+			ring->queue_stopped = true;
+		else
+			wake_queue = true;
+		spin_unlock_bh(&rtwpci->irq_lock);
+
+		if (wake_queue)
+			ieee80211_wake_queue(rtwdev->hw, q_map);
+	}
 
 	return 0;
 }
 
-static void rtw_pci_tx_isr(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
-			   u8 hw_queue)
+static u16 rtw_pci_tx_isr(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
+			  u8 hw_queue)
 {
 	struct ieee80211_hw *hw = rtwdev->hw;
 	struct ieee80211_tx_info *info;
@@ -1004,7 +1022,7 @@ static void rtw_pci_tx_isr(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
 	u32 count;
 	u32 bd_idx_addr;
 	u32 bd_idx, cur_rp, rp_idx;
-	u16 q_map;
+	u16 q_map, wake_queues = 0;
 
 	ring = &rtwpci->tx_rings[hw_queue];
 
@@ -1038,7 +1056,7 @@ static void rtw_pci_tx_isr(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
 		if (ring->queue_stopped &&
 		    avail_desc(ring->r.wp, rp_idx, ring->r.len) > 4) {
 			q_map = skb_get_queue_mapping(skb);
-			ieee80211_wake_queue(hw, q_map);
+			wake_queues |= BIT(q_map);
 			ring->queue_stopped = false;
 		}
 
@@ -1066,6 +1084,8 @@ static void rtw_pci_tx_isr(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
 	}
 
 	ring->r.rp = cur_rp;
+
+	return wake_queues;
 }
 
 static void rtw_pci_rx_isr(struct rtw_dev *rtwdev)
@@ -1085,6 +1105,10 @@ static int rtw_pci_get_hw_rx_ring_nr(struct rtw_dev *rtwdev,
 
 	ring = &rtwpci->rx_rings[RTW_RX_QUEUE_MPDU];
 	tmp = rtw_read32(rtwdev, RTK_PCI_RXBD_IDX_MPDUQ);
+#if defined(__FreeBSD__)
+	/* arm64 bus_read_4() lacks readl()'s trailing DMA read barrier. */
+	rmb();
+#endif
 	cur_wp = u32_get_bits(tmp, TRX_BD_HW_IDX_MASK);
 	if (cur_wp >= ring->r.wp)
 		count = cur_wp - ring->r.wp;
@@ -1219,26 +1243,36 @@ static irqreturn_t rtw_pci_interrupt_threadfn(int irq, void *dev)
 	struct rtw_dev *rtwdev = dev;
 	struct rtw_pci *rtwpci = (struct rtw_pci *)rtwdev->priv;
 	u32 irq_status[4];
+	u16 wake_queues = 0;
 	bool rx = false;
+	int q;
 
 	spin_lock_bh(&rtwpci->irq_lock);
 	rtw_pci_irq_recognized(rtwdev, rtwpci, irq_status);
 
 	if (irq_status[0] & IMR_MGNTDOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_MGMT);
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_MGMT);
 	if (irq_status[0] & IMR_HIGHDOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_HI0);
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_HI0);
 	if (irq_status[0] & IMR_BEDOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_BE);
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_BE);
 	if (irq_status[0] & IMR_BKDOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_BK);
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_BK);
 	if (irq_status[0] & IMR_VODOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_VO);
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_VO);
 	if (irq_status[0] & IMR_VIDOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_VI);
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_VI);
 	if (irq_status[3] & IMR_H2CDOK)
-		rtw_pci_tx_isr(rtwdev, rtwpci, RTW_TX_QUEUE_H2C);
-	if (irq_status[0] & IMR_ROK) {
+		wake_queues |= rtw_pci_tx_isr(rtwdev, rtwpci,
+		    RTW_TX_QUEUE_H2C);
+	if (irq_status[0] & (IMR_ROK | IMR_RDU) ||
+	    irq_status[1] & IMR_RXFOVW) {
 		rtw_pci_rx_isr(rtwdev);
 		rx = true;
 	}
@@ -1249,6 +1283,10 @@ static irqreturn_t rtw_pci_interrupt_threadfn(int irq, void *dev)
 	if (rtwpci->running)
 		rtw_pci_enable_interrupt(rtwdev, rtwpci, rx);
 	spin_unlock_bh(&rtwpci->irq_lock);
+
+	for (q = 0; q < rtwdev->hw->queues; q++)
+		if (wake_queues & BIT(q))
+			ieee80211_wake_queue(rtwdev->hw, q);
 
 	return IRQ_HANDLED;
 }

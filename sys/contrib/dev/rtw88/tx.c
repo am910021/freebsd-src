@@ -398,6 +398,7 @@ static void rtw_tx_data_pkt_info_update(struct rtw_dev *rtwdev,
 	rate_id = si->rate_id;
 	stbc = rtwdev->hal.txrx_1ss ? false : si->stbc_en;
 	ldpc = si->ldpc_en;
+	pkt_info->short_gi = si->sgi_enable;
 
 out:
 	pkt_info->seq = seq;
@@ -448,6 +449,14 @@ void rtw_tx_pkt_info_update(struct rtw_dev *rtwdev,
 	bmc = is_broadcast_ether_addr(hdr->addr1) ||
 	      is_multicast_ether_addr(hdr->addr1);
 
+#if defined(__FreeBSD__)
+	/* LinuxKPI requests status for every frame; keep precise reports for
+	 * control-port traffic without overflowing the firmware report queue.
+	 */
+	if (ieee80211_is_data(fc) &&
+	    !(info->control.flags & IEEE80211_TX_CTRL_PORT_CTRL_PROTO))
+		info->flags &= ~IEEE80211_TX_CTL_REQ_TX_STATUS;
+#endif
 	if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS)
 		rtw_tx_report_enable(rtwdev, pkt_info);
 
@@ -689,32 +698,43 @@ static void rtw_txq_push(struct rtw_dev *rtwdev,
 	rcu_read_unlock();
 }
 
-void __rtw_tx_work(struct rtw_dev *rtwdev)
+bool __rtw_tx_work(struct rtw_dev *rtwdev, bool block)
 {
-	struct rtw_txq *rtwtxq, *tmp;
+	struct rtw_txq *rtwtxq;
 
-	spin_lock_bh(&rtwdev->txq_lock);
-
-	list_for_each_entry_safe(rtwtxq, tmp, &rtwdev->txqs, list) {
-		struct ieee80211_txq *txq = rtwtxq_to_txq(rtwtxq);
+	if (block)
+		mutex_lock(&rtwdev->tx_work_mutex);
+	else if (!mutex_trylock(&rtwdev->tx_work_mutex))
+		return false;
+	for (;;) {
+		struct ieee80211_txq *txq;
 		unsigned long frame_cnt;
 
+		spin_lock_bh(&rtwdev->txq_lock);
+		if (list_empty(&rtwdev->txqs)) {
+			spin_unlock_bh(&rtwdev->txq_lock);
+			break;
+		}
+		rtwtxq = list_first_entry(&rtwdev->txqs, struct rtw_txq, list);
+		list_del_init(&rtwtxq->list);
+		spin_unlock_bh(&rtwdev->txq_lock);
+
+		txq = rtwtxq_to_txq(rtwtxq);
 		ieee80211_txq_get_depth(txq, &frame_cnt, NULL);
 		rtw_txq_push(rtwdev, rtwtxq, frame_cnt);
-
-		list_del_init(&rtwtxq->list);
 	}
 
 	rtw_hci_tx_kick_off(rtwdev);
+	mutex_unlock(&rtwdev->tx_work_mutex);
 
-	spin_unlock_bh(&rtwdev->txq_lock);
+	return true;
 }
 
 void rtw_tx_work(struct work_struct *w)
 {
 	struct rtw_dev *rtwdev = container_of(w, struct rtw_dev, tx_work);
 
-	__rtw_tx_work(rtwdev);
+	__rtw_tx_work(rtwdev, true);
 }
 
 void rtw_txq_init(struct rtw_dev *rtwdev, struct ieee80211_txq *txq)
@@ -736,10 +756,12 @@ void rtw_txq_cleanup(struct rtw_dev *rtwdev, struct ieee80211_txq *txq)
 		return;
 
 	rtwtxq = (struct rtw_txq *)txq->drv_priv;
+	mutex_lock(&rtwdev->tx_work_mutex);
 	spin_lock_bh(&rtwdev->txq_lock);
 	if (!list_empty(&rtwtxq->list))
 		list_del_init(&rtwtxq->list);
 	spin_unlock_bh(&rtwdev->txq_lock);
+	mutex_unlock(&rtwdev->tx_work_mutex);
 }
 
 static const enum rtw_tx_queue_type ac_to_hwq[] = {

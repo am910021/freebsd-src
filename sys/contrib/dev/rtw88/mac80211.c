@@ -44,10 +44,9 @@ static void rtw_ops_wake_tx_queue(struct ieee80211_hw *hw,
 	spin_unlock_bh(&rtwdev->txq_lock);
 
 	/* ensure to dequeue EAPOL (4/4) at the right time */
-	if (txq->ac == IEEE80211_AC_VO)
-		__rtw_tx_work(rtwdev);
-	else
-		queue_work(rtwdev->tx_wq, &rtwdev->tx_work);
+	if (txq->ac == IEEE80211_AC_VO && __rtw_tx_work(rtwdev, false))
+		return;
+	queue_work(rtwdev->tx_wq, &rtwdev->tx_work);
 }
 
 static int rtw_ops_start(struct ieee80211_hw *hw)

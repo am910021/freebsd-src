@@ -2693,7 +2693,7 @@ ieee80211_ampdu_request(struct ieee80211_node *ni,
 {
 	struct ieee80211com *ic = ni->ni_ic;
 	uint16_t args[5];
-	int tid, dialogtoken;
+	int tid, dialogtoken, error;
 	static int tokens = 0;	/* XXX */
 
 	/* XXX locking */
@@ -2744,8 +2744,9 @@ ieee80211_ampdu_request(struct ieee80211_node *ni,
 	args[4] = _IEEE80211_SHIFTMASK(tap->txa_start, IEEE80211_BASEQ_START)
 		| _IEEE80211_SHIFTMASK(0, IEEE80211_BASEQ_FRAG)
 		;
-	return ic->ic_send_action(ni, IEEE80211_ACTION_CAT_BA,
+	error = ic->ic_send_action(ni, IEEE80211_ACTION_CAT_BA,
 		IEEE80211_ACTION_BA_ADDBA_REQUEST, args);
+	return (error == 0);
 }
 
 /*
