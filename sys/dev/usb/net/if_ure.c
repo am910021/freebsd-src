@@ -2202,18 +2202,26 @@ ure_rtl8152_nic_reset(struct ure_softc *sc)
 	/* Configure Rx FIFO threshold. */
 	ure_write_4(sc, URE_PLA_RXFIFO_CTRL0, URE_MCU_TYPE_PLA,
 	    URE_RXFIFO_THR1_NORMAL);
-	if (usbd_get_speed(sc->sc_ue.ue_udev) == USB_SPEED_FULL) {
+	if (sc->sc_flags & URE_FLAG_8153) {
+		ure_write_2(sc, URE_PLA_RXFIFO_CTRL1, URE_MCU_TYPE_PLA,
+		    URE_RXFIFO_THR2_NORMAL);
+		ure_write_2(sc, URE_PLA_RXFIFO_CTRL2, URE_MCU_TYPE_PLA,
+		    URE_RXFIFO_THR3_NORMAL);
+	} else if (usbd_get_speed(sc->sc_ue.ue_udev) == USB_SPEED_FULL) {
 		rx_fifo1 = URE_RXFIFO_THR2_FULL;
 		rx_fifo2 = URE_RXFIFO_THR3_FULL;
 	} else {
 		rx_fifo1 = URE_RXFIFO_THR2_HIGH;
 		rx_fifo2 = URE_RXFIFO_THR3_HIGH;
 	}
-	ure_write_4(sc, URE_PLA_RXFIFO_CTRL1, URE_MCU_TYPE_PLA, rx_fifo1);
-	ure_write_4(sc, URE_PLA_RXFIFO_CTRL2, URE_MCU_TYPE_PLA, rx_fifo2);
+	if ((sc->sc_flags & URE_FLAG_8153) == 0) {
+		ure_write_4(sc, URE_PLA_RXFIFO_CTRL1, URE_MCU_TYPE_PLA, rx_fifo1);
+		ure_write_4(sc, URE_PLA_RXFIFO_CTRL2, URE_MCU_TYPE_PLA, rx_fifo2);
+	}
 
 	/* Configure Tx FIFO threshold. */
 	ure_write_4(sc, URE_PLA_TXFIFO_CTRL, URE_MCU_TYPE_PLA,
+	    (sc->sc_flags & URE_FLAG_8153) ? URE_TXFIFO_THR_NORMAL2 :
 	    URE_TXFIFO_THR_NORMAL);
 }
 
