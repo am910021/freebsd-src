@@ -269,8 +269,7 @@ ehci_init_sub(struct ehci_softc *sc)
 
 	/* turn on controller */
 	EOWRITE4(sc, EHCI_USBCMD,
-	    ((sc->sc_init_quirks & EHCI_INITQ_ITC_2) != 0 ?
-	    EHCI_CMD_ITC_2 : EHCI_CMD_ITC_1) |
+	    EHCI_CMD_ITC_1 |
 	    (EOREAD4(sc, EHCI_USBCMD) & EHCI_CMD_FLS_M) |
 	    EHCI_CMD_ASE |
 	    EHCI_CMD_PSE |

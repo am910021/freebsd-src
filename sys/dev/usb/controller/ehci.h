@@ -348,7 +348,6 @@ typedef struct ehci_softc {
 	uint8_t	sc_init_quirks;		/* controller initialization quirks */
 #define	EHCI_INITQ_MMIO_BARRIER		0x01
 #define	EHCI_INITQ_INTR_AFTER_RUN	0x02
-#define	EHCI_INITQ_ITC_2		0x04
 #define	EHCI_INITQ_INTR_QH_FRAMELIST	0x08
 #define	EHCI_INITQ_NRL_4		0x10
 
