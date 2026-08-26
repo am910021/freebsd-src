@@ -32,6 +32,8 @@ options		KDB
 options		KDB_TRACE
 options		DDB
 
+options		IEEE80211_SUPPORT_SUPERG
+
 # RK3588-DIAG V094: use the Armbian/LTS DTB iommu-map entries for PCIe DMA.
 # RK3588 PCIe endpoints are behind mmu600_pcie in the board DTB.
 options		IOMMU
