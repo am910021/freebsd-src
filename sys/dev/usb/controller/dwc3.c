@@ -67,6 +67,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <dev/extres/clk/clk.h>
+#include <dev/extres/hwreset/hwreset.h>
 #include <dev/extres/phy/phy_usb.h>
 #endif
 
@@ -99,6 +100,8 @@ struct snps_dwc3_softc {
 	clk_t			clk_ref;
 	clk_t			clk_suspend;
 	clk_t			clk_bus;
+	hwreset_t		reset;
+	bool			reset_deasserted;
 	phy_t			usb2_phy;
 	phy_t			usb3_phy;
 	bool			usb2_phy_enabled;
@@ -142,6 +145,13 @@ snps_dwc3_release_fdt_resources(struct snps_dwc3_softc *sc)
 	if (sc->usb2_phy != NULL) {
 		phy_release(sc->usb2_phy);
 		sc->usb2_phy = NULL;
+	}
+	if (sc->reset != NULL) {
+		if (sc->reset_deasserted)
+			(void)hwreset_assert(sc->reset);
+		hwreset_release(sc->reset);
+		sc->reset = NULL;
+		sc->reset_deasserted = false;
 	}
 	if (sc->clk_bus != NULL) {
 		(void)clk_release(sc->clk_bus);
@@ -765,6 +775,94 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 	sc->bst = rman_get_bustag(sc->mem_res);
 	sc->bsh = rman_get_bushandle(sc->mem_res);
 
+#ifdef FDT
+	if (is_fdt) {
+		node = ofw_bus_get_node(dev);
+		clock_error = 0;
+		strict_resources = sc->soc_ops != NULL &&
+		    (sc->soc_ops->flags & DWC3_SOC_F_STRICT_RESOURCES) != 0;
+
+		if (sc->soc_ops != NULL &&
+		    sc->soc_ops->enable_power != NULL) {
+			error = sc->soc_ops->enable_power(dev);
+			if (error != 0) {
+				snps_dwc3_schedule_retry(sc,
+				    "late power-domain provider", error);
+				goto fail;
+			}
+		}
+
+		/* No controller MMIO is safe until its clocks are running. */
+		if (ofw_bus_is_compatible(dev, "rockchip,rk3328-dwc3") == 1 ||
+		    ofw_bus_is_compatible(dev, "rockchip,rk3568-dwc3") == 1 ||
+		    sc->soc_ops != NULL) {
+			error = clk_get_by_ofw_name(dev, node, "ref_clk",
+			    &sc->clk_ref);
+			if (error != 0) {
+				device_printf(dev, "Cannot get ref_clk: %d\n", error);
+				if (strict_resources)
+					clock_error = error;
+			}
+			error = clk_get_by_ofw_name(dev, node, "suspend_clk",
+			    &sc->clk_suspend);
+			if (error != 0) {
+				device_printf(dev, "Cannot get suspend_clk: %d\n", error);
+				if (strict_resources && clock_error == 0)
+					clock_error = error;
+			}
+			error = clk_get_by_ofw_name(dev, node, "bus_clk",
+			    &sc->clk_bus);
+			if (error != 0) {
+				device_printf(dev, "Cannot get bus_clk: %d\n", error);
+				if (strict_resources && clock_error == 0)
+					clock_error = error;
+			}
+		}
+
+		if (strict_resources) {
+			if (clock_error == 0)
+				clock_error = snps_dwc3_enable_required_clk(dev,
+				    sc->clk_ref, "ref_clk");
+			if (clock_error == 0)
+				clock_error = snps_dwc3_enable_required_clk(dev,
+				    sc->clk_suspend, "suspend_clk");
+			if (clock_error == 0)
+				clock_error = snps_dwc3_enable_required_clk(dev,
+				    sc->clk_bus, "bus_clk");
+			if (clock_error != 0) {
+				snps_dwc3_schedule_retry(sc,
+				    "late clock provider", clock_error);
+				error = ENXIO;
+				goto fail;
+			}
+		} else {
+			if (sc->clk_ref != NULL && clk_enable(sc->clk_ref) != 0)
+				device_printf(dev, "Cannot enable ref_clk\n");
+			if (sc->clk_suspend != NULL &&
+			    clk_enable(sc->clk_suspend) != 0)
+				device_printf(dev, "Cannot enable suspend_clk\n");
+			if (sc->clk_bus != NULL && clk_enable(sc->clk_bus) != 0)
+				device_printf(dev, "Cannot enable bus_clk\n");
+		}
+
+		error = hwreset_get_by_ofw_idx(dev, node, 0, &sc->reset);
+		if (error != 0 && strict_resources) {
+			device_printf(dev, "Cannot get controller reset: %d\n", error);
+			snps_dwc3_schedule_retry(sc, "late reset provider", error);
+			goto fail;
+		}
+		if (sc->reset != NULL) {
+			error = hwreset_deassert(sc->reset);
+			if (error != 0) {
+				device_printf(dev,
+				    "Cannot deassert controller reset: %d\n", error);
+				goto fail;
+			}
+			sc->reset_deasserted = true;
+		}
+	}
+#endif
+
 	sc->snpsid = DWC3_READ(sc, DWC3_GSNPSID);
 	sc->snpsversion = DWC3_VERSION(sc->snpsid);
 	sc->snpsrevision = DWC3_REVISION(sc->snpsid);
@@ -799,64 +897,7 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 	if (!is_fdt)
 		goto skip_phys;
 
-	node = ofw_bus_get_node(dev);
-	clock_error = 0;
 	phy_error = 0;
-	strict_resources = sc->soc_ops != NULL &&
-	    (sc->soc_ops->flags & DWC3_SOC_F_STRICT_RESOURCES) != 0;
-
-	/* Get the clocks if any */
-	if (ofw_bus_is_compatible(dev, "rockchip,rk3328-dwc3") == 1 ||
-	    ofw_bus_is_compatible(dev, "rockchip,rk3568-dwc3") == 1 ||
-	    sc->soc_ops != NULL) {
-		error = clk_get_by_ofw_name(dev, node, "ref_clk",
-		    &sc->clk_ref);
-		if (error != 0) {
-			device_printf(dev, "Cannot get ref_clk: %d\n", error);
-			if (strict_resources)
-				clock_error = error;
-		}
-		error = clk_get_by_ofw_name(dev, node, "suspend_clk",
-		    &sc->clk_suspend);
-		if (error != 0) {
-			device_printf(dev, "Cannot get suspend_clk: %d\n", error);
-			if (strict_resources && clock_error == 0)
-				clock_error = error;
-		}
-		error = clk_get_by_ofw_name(dev, node, "bus_clk",
-		    &sc->clk_bus);
-		if (error != 0) {
-			device_printf(dev, "Cannot get bus_clk: %d\n", error);
-			if (strict_resources && clock_error == 0)
-				clock_error = error;
-		}
-	}
-
-	if (strict_resources) {
-		if (clock_error == 0)
-			clock_error = snps_dwc3_enable_required_clk(dev,
-			    sc->clk_ref, "ref_clk");
-		if (clock_error == 0)
-			clock_error = snps_dwc3_enable_required_clk(dev,
-			    sc->clk_suspend, "suspend_clk");
-		if (clock_error == 0)
-			clock_error = snps_dwc3_enable_required_clk(dev,
-			    sc->clk_bus, "bus_clk");
-		if (clock_error != 0) {
-			snps_dwc3_schedule_retry(sc,
-			    "late clock provider", clock_error);
-			error = ENXIO;
-			goto fail;
-		}
-	} else {
-		if (sc->clk_ref != NULL && clk_enable(sc->clk_ref) != 0)
-			device_printf(dev, "Cannot enable ref_clk\n");
-		if (sc->clk_suspend != NULL &&
-		    clk_enable(sc->clk_suspend) != 0)
-			device_printf(dev, "Cannot enable suspend_clk\n");
-		if (sc->clk_bus != NULL && clk_enable(sc->clk_bus) != 0)
-			device_printf(dev, "Cannot enable bus_clk\n");
-	}
 	snps_dwc3_soc_pipe_setup(sc);
 
 	/* Get the phys */

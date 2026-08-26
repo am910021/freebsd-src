@@ -8,7 +8,10 @@
 #include <sys/bus.h>
 #include <sys/condvar.h>
 
+#include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+
+#include <arm64/rockchip/rk3588_power.h>
 
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -25,6 +28,7 @@
 #define	DWC3_GUCTL_REFCLKPER_SHIFT		22
 #define	DWC3_GUCTL1_DEV_DECOUPLE_L1L2_EVT	(1U << 31)
 #define	DWC3_GUCTL1_DEV_L1_EXIT_BY_HW		(1U << 24)
+#define	DWC3_GUCTL1_PARKMODE_DISABLE_SS		(1U << 17)
 
 #define	RK3588_DWC3_GFLADJ_REFCLK_FLADJ_MASK	0x003fff00
 #define	RK3588_DWC3_GFLADJ_REFCLK_FLADJ_SHIFT	8
@@ -42,6 +46,15 @@ rk3588_dwc3_match(device_t dev)
 {
 
 	return (ofw_bus_is_compatible(dev, "rockchip,rk3588-dwc3"));
+}
+
+static int
+rk3588_dwc3_enable_power(device_t dev)
+{
+	int error;
+
+	error = rk3588_power_domain_enable_by_node(dev, ofw_bus_get_node(dev));
+	return (error == ENOENT ? 0 : error);
 }
 
 static void
@@ -100,12 +113,14 @@ rk3588_dwc3_configure_core(const struct dwc3_soc_context *ctx)
 	guctl1 |= DWC3_GUCTL1_DEV_L1_EXIT_BY_HW;
 	guctl1 |= DWC3_GUCTL1_DEV_DECOUPLE_L1L2_EVT;
 	guctl1 |= DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS;
+	guctl1 |= DWC3_GUCTL1_PARKMODE_DISABLE_SS;
 	RK3588_DWC3_WRITE(ctx, DWC3_GUCTL1, guctl1);
 	return (0);
 }
 
 static const struct dwc3_soc_ops rk3588_dwc3_soc_ops = {
 	.match = rk3588_dwc3_match,
+	.enable_power = rk3588_dwc3_enable_power,
 	.pipe_setup = rk3588_dwc3_pipe_setup,
 	.configure_core = rk3588_dwc3_configure_core,
 	.flags = DWC3_SOC_F_STRICT_RESOURCES |

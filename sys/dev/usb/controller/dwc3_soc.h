@@ -25,6 +25,7 @@ struct dwc3_soc_context {
 
 struct dwc3_soc_ops {
 	bool		(*match)(device_t);
+	int		(*enable_power)(device_t);
 	void		(*pipe_setup)(const struct dwc3_soc_context *);
 	int		(*configure_core)(const struct dwc3_soc_context *);
 	uint32_t	flags;
