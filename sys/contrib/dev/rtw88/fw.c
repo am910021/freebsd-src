@@ -798,6 +798,11 @@ void rtw_fw_beacon_filter_config(struct rtw_dev *rtwdev, bool connect,
 	if (!rtw_fw_feature_check(&rtwdev->fw, FW_FEATURE_BCN_FILTER))
 		return;
 
+#if defined(__FreeBSD__)
+	if (connect)
+		return;
+#endif
+
 	if (bss_conf->cqm_rssi_thold)
 		thold = bss_conf->cqm_rssi_thold;
 	if (bss_conf->cqm_rssi_hyst)

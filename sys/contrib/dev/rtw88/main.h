@@ -2087,6 +2087,9 @@ struct rtw_dev {
 	struct rtw_lps_conf lps_conf;
 	bool ps_enabled;
 	bool beacon_loss;
+#if defined(__FreeBSD__)
+	bool skip_beacon_loss;
+#endif
 	struct completion lps_leave_check;
 
 	struct rtw_debugfs *debugfs;

@@ -228,13 +228,27 @@ static void rtw_sw_beacon_loss_check(struct rtw_dev *rtwdev,
 	int watchdog_delay = 2000000 / 1024; /* TU */
 	int beacon_int, expected_beacons;
 
-	if (rtw_fw_feature_check(&rtwdev->fw, FW_FEATURE_BCN_FILTER) || !rtwvif)
+	if (!rtwvif)
 		return;
+#if !defined(__FreeBSD__)
+	if (rtw_fw_feature_check(&rtwdev->fw, FW_FEATURE_BCN_FILTER))
+		return;
+#else
+	if (rtwdev->skip_beacon_loss) {
+		rtwdev->skip_beacon_loss = false;
+		rtwdev->beacon_loss = false;
+		return;
+	}
+#endif
 
 	beacon_int = rtwvif_to_vif(rtwvif)->bss_conf.beacon_int;
 	expected_beacons = DIV_ROUND_UP(watchdog_delay, beacon_int);
 
 	rtwdev->beacon_loss = received_beacons < expected_beacons / 2;
+#if defined(__FreeBSD__)
+	if (rtwdev->beacon_loss)
+		ieee80211_beacon_loss(rtwvif_to_vif(rtwvif));
+#endif
 }
 
 /* process TX/RX statistics periodically for hardware,
@@ -1520,6 +1534,9 @@ void rtw_core_scan_complete(struct rtw_dev *rtwdev, struct ieee80211_vif *vif,
 	if (!rtwvif)
 		return;
 
+#if defined(__FreeBSD__)
+	rtwdev->skip_beacon_loss = true;
+#endif
 	clear_bit(RTW_FLAG_SCANNING, rtwdev->flags);
 	clear_bit(RTW_FLAG_DIG_DISABLE, rtwdev->flags);
 
