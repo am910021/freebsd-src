@@ -836,7 +836,7 @@ lkpi_lsta_alloc(struct ieee80211vap *vap, const uint8_t mac[IEEE80211_ADDR_LEN],
 	/* Deferred TX path. */
 	LKPI_80211_LSTA_TXQ_LOCK_INIT(lsta);
 	TASK_INIT(&lsta->txq_task, 0, lkpi_80211_txq_task, lsta);
-	mbufq_init(&lsta->txq, 32 * NAPI_POLL_WEIGHT);
+	mbufq_init(&lsta->txq, 128 * NAPI_POLL_WEIGHT);
 	lsta->txq_ready = true;
 
 	return (lsta);
