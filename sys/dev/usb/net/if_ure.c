@@ -1075,8 +1075,11 @@ ure_attach_post_sub(struct usb_ether *ue)
 	if_setstartfn(ifp, uether_start);
 	if_setioctlfn(ifp, ure_ioctl);
 	if_setinitfn(ifp, uether_init);
-	/* Match the Linux reference's 1000-packet transmit backlog. */
-	if_setsendqlen(ifp, 1024);
+	/* Absorb TCP bursts on RTL8153 and RTL8153B. */
+	if ((sc->sc_flags & (URE_FLAG_8153 | URE_FLAG_8153B)) != 0)
+		if_setsendqlen(ifp, 1536);
+	else
+		if_setsendqlen(ifp, 1024);
 	if_setsendqready(ifp);
 
 	if_setcapabilitiesbit(ifp, IFCAP_VLAN_MTU, 0);
