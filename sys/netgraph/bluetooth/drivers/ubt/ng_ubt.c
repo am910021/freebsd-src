@@ -657,6 +657,7 @@ ubt_attach(device_t dev)
 	struct usb_interface_descriptor *id;
 	struct usb_interface		*iface[2];
 	uint32_t			wMaxPacketSize;
+	int				isoc_enable;
 	uint8_t				alt_index, i, j;
 	uint8_t				iface_index[2];
 
@@ -670,6 +671,14 @@ ubt_attach(device_t dev)
 
 	sc->sc_dev = dev;
 	sc->sc_debug = NG_UBT_WARN_LEVEL;
+	isoc_enable = ng_usb_isoc_enable;
+
+	/* SCO setup stalls ACL bulk-in on the onboard RTL8822CU. */
+	if (uaa->info.idVendor == 0x0bda && uaa->info.idProduct == 0xc131) {
+		isoc_enable = 0;
+		device_printf(dev,
+		    "SCO isochronous transfers disabled for RTL8822CU\n");
+	}
 
 	/*
 	 * Sanity checks.
@@ -782,7 +791,7 @@ ubt_attach(device_t dev)
 
 	/* Setup transfers for both interfaces */
 	if (usbd_transfer_setup(uaa->device, iface_index, sc->sc_xfer, ubt_config,
-			ng_usb_isoc_enable ? UBT_N_TRANSFER : UBT_IF_1_ISOC_DT_RD1,
+			isoc_enable ? UBT_N_TRANSFER : UBT_IF_1_ISOC_DT_RD1,
 			sc, &sc->sc_if_mtx)) {
 		UBT_ALERT(sc, "could not allocate transfers\n");
 		goto detach;
