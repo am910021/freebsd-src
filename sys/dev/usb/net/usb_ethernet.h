@@ -93,6 +93,7 @@ struct usb_ether {
 	struct usb_ether_cfg_task	ue_tick_task[2];
 
 	int			ue_unit;
+	bool			ue_unit_hinted;
 
 	/* ethernet address from eeprom */
 	uint8_t			ue_eaddr[ETHER_ADDR_LEN];

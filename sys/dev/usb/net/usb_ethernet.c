@@ -68,6 +68,7 @@ MODULE_DEPEND(uether, usb, 1, 1, 1);
 MODULE_DEPEND(uether, miibus, 1, 1, 1);
 
 static struct unrhdr *ueunit;
+static struct unrhdr *uefixed;
 
 static usb_proc_callback_t ue_attach_post_task;
 static usb_proc_callback_t ue_promisc_task;
@@ -81,6 +82,54 @@ static void	ue_init(void *);
 static void	ue_start(if_t);
 static int	ue_ifmedia_upd(if_t);
 static void	ue_watchdog(void *);
+
+static bool
+ue_get_hint_mac(int unit, uint8_t *eaddr)
+{
+	const char *value;
+	unsigned int octet[ETHER_ADDR_LEN];
+	char trailing;
+	int i;
+
+	if (resource_string_value("ue", unit, "mac", &value) != 0 ||
+	    sscanf(value, "%x:%x:%x:%x:%x:%x%c", &octet[0], &octet[1],
+	    &octet[2], &octet[3], &octet[4], &octet[5], &trailing) !=
+	    ETHER_ADDR_LEN)
+		return (false);
+	for (i = 0; i < ETHER_ADDR_LEN; i++) {
+		if (octet[i] > UINT8_MAX)
+			return (false);
+		eaddr[i] = octet[i];
+	}
+	return (!ETHER_IS_MULTICAST(eaddr) && !ETHER_IS_ZERO(eaddr));
+}
+
+static int
+ue_get_hinted_unit(struct usb_ether *ue)
+{
+	uint8_t eaddr[ETHER_ADDR_LEN];
+	int anchor, found, unit;
+
+	anchor = 0;
+	found = -1;
+	while (resource_find_dev(&anchor, "ue", &unit, "mac", NULL) == 0) {
+		if (unit < 0 || !ue_get_hint_mac(unit, eaddr) ||
+		    memcmp(eaddr, ue->ue_eaddr, ETHER_ADDR_LEN) != 0)
+			continue;
+		if (found != -1) {
+			device_printf(ue->ue_dev,
+			    "MAC address matches multiple ue hints\n");
+			return (-1);
+		}
+		found = unit;
+	}
+	if (found != -1 && alloc_unr_specific(uefixed, found) != found) {
+		device_printf(ue->ue_dev, "hinted ue%d is already attached\n",
+		    found);
+		return (-1);
+	}
+	return (found);
+}
 
 /*
  * Return values:
@@ -213,7 +262,13 @@ ue_attach_post_task(struct usb_proc_msg *_task)
 
 	UE_UNLOCK(ue);
 
-	ue->ue_unit = alloc_unr(ueunit);
+	ue->ue_unit = ue_get_hinted_unit(ue);
+	ue->ue_unit_hinted = ue->ue_unit >= 0;
+	if (ue->ue_unit_hinted)
+		device_printf(ue->ue_dev, "using hinted ue%d for %6D\n",
+		    ue->ue_unit, ue->ue_eaddr, ":");
+	else
+		ue->ue_unit = alloc_unr(ueunit);
 	usb_callout_init_mtx(&ue->ue_watchdog, ue->ue_mtx, 0);
 	sysctl_ctx_init(&ue->ue_sysctl_ctx);
 	mbufq_init(&ue->ue_rxq, 0 /* unlimited length */);
@@ -280,7 +335,7 @@ fail:
 	mbufq_drain(&ue->ue_rxq);
 
 	/* free unit */
-	free_unr(ueunit, ue->ue_unit);
+	free_unr(ue->ue_unit_hinted ? uefixed : ueunit, ue->ue_unit);
 	if (ue->ue_ifp != NULL) {
 		if_free(ue->ue_ifp);
 		ue->ue_ifp = NULL;
@@ -332,7 +387,7 @@ uether_ifdetach(struct usb_ether *ue)
 		mbufq_drain(&ue->ue_rxq);
 
 		/* free unit */
-		free_unr(ueunit, ue->ue_unit);
+		free_unr(ue->ue_unit_hinted ? uefixed : ueunit, ue->ue_unit);
 	}
 
 	/* free taskqueue, if any */
@@ -553,10 +608,22 @@ uether_ioctl(if_t ifp, u_long command, caddr_t data)
 static int
 uether_modevent(module_t mod, int type, void *data)
 {
+	uint8_t eaddr[ETHER_ADDR_LEN];
+	int anchor, unit;
 
 	switch (type) {
 	case MOD_LOAD:
 		ueunit = new_unrhdr(0, INT_MAX, NULL);
+		uefixed = new_unrhdr(0, INT_MAX, NULL);
+		anchor = 0;
+		while (resource_find_dev(&anchor, "ue", &unit, "mac", NULL) == 0) {
+			if (unit < 0 || !ue_get_hint_mac(unit, eaddr)) {
+				printf("uether: invalid hint.ue.%d.mac\n", unit);
+				continue;
+			}
+			if (alloc_unr_specific(ueunit, unit) != unit)
+				printf("uether: cannot reserve hinted ue%d\n", unit);
+		}
 		break;
 	case MOD_UNLOAD:
 		break;
