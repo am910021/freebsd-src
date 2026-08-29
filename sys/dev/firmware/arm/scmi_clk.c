@@ -272,6 +272,7 @@ scmi_clk_attrs(struct scmi_clk_softc *sc, int index)
 	struct scmi_clk_attrs_out out;
 	struct scmi_clk_attrs_in in;
 	struct scmi_req req;
+	int32_t status;
 	int error;
 	char *clock_name;
 
@@ -288,7 +289,10 @@ scmi_clk_attrs(struct scmi_clk_softc *sc, int index)
 	if (error != 0)
 		return (error);
 
-	if (out.status != 0)
+	status = (int32_t)le32toh(out.status);
+	if (status == SCMI_NOT_FOUND)
+		return (ENOENT);
+	if (status != 0)
 		return (ENXIO);
 
 	if (out.attributes & CLK_ATTRS_EXT_CLK_NAME) {
@@ -312,6 +316,7 @@ scmi_clk_discover(struct scmi_clk_softc *sc)
 	struct scmi_req req;
 	int nclocks;
 	int failing;
+	int unavailable;
 	int error;
 	int i;
 
@@ -335,15 +340,23 @@ scmi_clk_discover(struct scmi_clk_softc *sc)
 	device_printf(sc->dev, "Found %d clocks.\n", nclocks);
 
 	failing = 0;
+	unavailable = 0;
 
 	for (i = 0; i < nclocks; i++) {
 		error = scmi_clk_attrs(sc, i);
 		if (error) {
+			failing++;
+			if (error == ENOENT) {
+				unavailable++;
+				continue;
+			}
 			device_printf(sc->dev,
 			    "Could not process clock index %d.\n", i);
-			failing++;
 		}
 	}
+	if (unavailable != 0)
+		device_printf(sc->dev, "%d of %d firmware clocks unavailable.\n",
+		    unavailable, nclocks);
 
 	if (failing == nclocks)
 		return (ENXIO);
