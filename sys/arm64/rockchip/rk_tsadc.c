@@ -35,12 +35,15 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/callout.h>
+#include <sys/cpu.h>
 #include <sys/gpio.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/malloc.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
 #include <machine/bus.h>
 
@@ -52,6 +55,7 @@
 #include <dev/ofw/ofw_bus_subr.h>
 
 #include "syscon_if.h"
+#include "cpufreq_if.h"
 #include "rk_tsadc_if.h"
 
 /* Version of HW */
@@ -105,6 +109,11 @@
 #define	TSADC_V4_INT_PD_CLEAR_MASK		0xffffffff
 #define	TSADC_V4_DATA_MASK			0x1ff
 
+#define	TSADC_MAX_THERMAL_ZONES		7
+#define	TSADC_MAX_COOLING_CPUS		8
+#define	TSADC_MAX_CPUFREQ_LEVELS	64
+#define	TSADC_IDLE_POLL_MS		1000
+
 /* V3 GFR registers */
 #define	GRF_SARADC_TESTBIT			0x0e644
 #define	 GRF_SARADC_TESTBIT_ON				(0x10001 << 2)
@@ -144,6 +153,24 @@ struct tsadc_calib_info {
 
 struct tsadc_softc;
 
+struct tsadc_cooling_cpu {
+	phandle_t	node;
+	device_t	dev;
+	bool		capped;
+};
+
+struct tsadc_thermal_zone {
+	char		name[32];
+	int		sensor;
+	int		trip;
+	int		hysteresis;
+	int		polling_ms;
+	int		limit_freq;
+	int		ncpus;
+	bool		throttled;
+	struct tsadc_cooling_cpu cpus[TSADC_MAX_COOLING_CPUS];
+};
+
 struct tsadc_conf {
 	int			version;
 	int			q_sel_ntc;
@@ -180,12 +207,21 @@ struct tsadc_softc {
 	int			shutdown_pol;
 
 	int			alarm_temp;
+
+	struct callout		thermal_callout;
+	struct task		thermal_task;
+	struct tsadc_thermal_zone thermal_zones[TSADC_MAX_THERMAL_ZONES];
+	int			nthermal_zones;
+	int			thermal_trip_override;
+	bool			thermal_started;
+	bool			detaching;
 };
 
 static void tsadc_init_v8(struct tsadc_softc *);
 static void tsadc_init_tsensor_v8(struct tsadc_softc *, struct tsensor *);
 static uint32_t tsadc_read_data_v8(struct tsadc_softc *, struct tsensor *);
 static int tsadc_intr_v8(struct tsadc_softc *);
+static void tsadc_thermal_callout(void *);
 
 static struct rk_calib_entry rk3288_calib_data[] = {
 	{3800, -40000},
@@ -775,6 +811,317 @@ tsadc_get_temp(device_t dev, device_t cdev, uintptr_t id, int *val)
 	return (ERANGE);
 }
 
+static device_t
+tsadc_cpufreq_device(phandle_t node)
+{
+	devclass_t dc;
+	device_t *devs, cf_dev;
+	int count, i;
+
+	dc = devclass_find("cpu");
+	if (dc == NULL || devclass_get_devices(dc, &devs, &count) != 0)
+		return (NULL);
+	cf_dev = NULL;
+	for (i = 0; i < count; i++) {
+		if (ofw_bus_get_node(devs[i]) != node)
+			continue;
+		cf_dev = device_find_child(devs[i], "cpufreq", -1);
+		break;
+	}
+	free(devs, M_TEMP);
+	return (cf_dev);
+}
+
+static int
+tsadc_thermal_cap_cpu(struct tsadc_cooling_cpu *cpu, int target,
+    int *applied)
+{
+	struct cf_level current, *levels;
+	device_t dev;
+	int count, error, i, selected;
+
+	dev = cpu->dev;
+	if (dev == NULL) {
+		dev = tsadc_cpufreq_device(cpu->node);
+		if (dev == NULL)
+			return (ENXIO);
+		cpu->dev = dev;
+	}
+
+	levels = mallocarray(TSADC_MAX_CPUFREQ_LEVELS, sizeof(*levels),
+	    M_TEMP, M_WAITOK);
+	count = TSADC_MAX_CPUFREQ_LEVELS;
+	error = CPUFREQ_LEVELS(dev, levels, &count);
+	if (error != 0)
+		goto out;
+	if (count == 0) {
+		error = ENXIO;
+		goto out;
+	}
+	selected = -1;
+	if (target == 0) {
+		error = CPUFREQ_GET(dev, &current);
+		if (error != 0)
+			goto out;
+		for (i = 0; i < count; i++) {
+			if (levels[i].total_set.freq >= current.total_set.freq)
+				continue;
+			if (selected == -1 || levels[i].total_set.freq >
+			    levels[selected].total_set.freq)
+				selected = i;
+		}
+		if (selected == -1) {
+			for (i = 0; i < count; i++) {
+				if (levels[i].total_set.freq ==
+				    current.total_set.freq) {
+					selected = i;
+					break;
+				}
+			}
+		}
+	} else {
+		for (i = 0; i < count; i++) {
+			if (levels[i].total_set.freq == target) {
+				selected = i;
+				break;
+			}
+		}
+	}
+	if (selected == -1) {
+		error = ENXIO;
+		goto out;
+	}
+	error = CPUFREQ_SET(dev, &levels[selected], CPUFREQ_PRIO_KERN);
+	if (error == 0) {
+		cpu->capped = true;
+		*applied = levels[selected].total_set.freq;
+	}
+out:
+	free(levels, M_TEMP);
+	return (error);
+}
+
+static bool
+tsadc_thermal_restore_zone(struct tsadc_thermal_zone *zone)
+{
+	bool capped;
+	int error, i;
+
+	capped = false;
+	for (i = 0; i < zone->ncpus; i++) {
+		if (!zone->cpus[i].capped)
+			continue;
+		error = CPUFREQ_SET(zone->cpus[i].dev, NULL,
+		    CPUFREQ_PRIO_KERN);
+		if (error == 0)
+			zone->cpus[i].capped = false;
+		else
+			capped = true;
+	}
+	zone->throttled = capped;
+	if (!capped)
+		zone->limit_freq = 0;
+	return (!capped);
+}
+
+static void
+tsadc_thermal_task(void *arg, int pending)
+{
+	struct tsadc_softc *sc;
+	struct tsadc_thermal_zone *zone;
+	bool active, capped;
+	int applied, delay, error, i, j, target, temp, trip;
+
+	sc = arg;
+	active = false;
+	delay = TSADC_IDLE_POLL_MS;
+	for (i = 0; i < sc->nthermal_zones; i++) {
+		zone = &sc->thermal_zones[i];
+		error = tsadc_read_temp(sc, sc->conf->tsensors + zone->sensor,
+		    &temp);
+		if (error != 0)
+			continue;
+		trip = sc->thermal_trip_override != 0 ?
+		    sc->thermal_trip_override : zone->trip;
+		if (temp >= trip) {
+			capped = false;
+			target = 0;
+			for (j = 0; j < zone->ncpus; j++) {
+				if (tsadc_thermal_cap_cpu(&zone->cpus[j], target,
+				    &applied) == 0) {
+					capped = true;
+					if (target == 0)
+						target = applied;
+				}
+			}
+			if (capped && target != zone->limit_freq) {
+				device_printf(sc->dev,
+				    "%s: %d.%03dC, CPU frequency capped at %d MHz\n",
+				    zone->name, temp / 1000, abs(temp % 1000), target);
+				zone->limit_freq = target;
+				zone->throttled = true;
+			}
+		} else if (zone->throttled &&
+		    temp <= trip - zone->hysteresis) {
+			if (tsadc_thermal_restore_zone(zone))
+				device_printf(sc->dev,
+				    "%s: %d.%03dC, CPU frequency restored\n",
+				    zone->name, temp / 1000, abs(temp % 1000));
+		}
+		if (zone->throttled) {
+			active = true;
+			delay = MIN(delay, zone->polling_ms);
+		}
+	}
+
+	if (!sc->detaching)
+		callout_reset(&sc->thermal_callout,
+		    MAX(1, (hz * (active ? delay : TSADC_IDLE_POLL_MS) + 999) /
+		    1000), tsadc_thermal_callout, sc);
+}
+
+static void
+tsadc_thermal_callout(void *arg)
+{
+	struct tsadc_softc *sc;
+
+	sc = arg;
+	if (!sc->detaching)
+		taskqueue_enqueue(taskqueue_thread, &sc->thermal_task);
+}
+
+static void
+tsadc_thermal_add_cpu(struct tsadc_thermal_zone *zone, phandle_t node)
+{
+	int i;
+
+	for (i = 0; i < zone->ncpus; i++) {
+		if (zone->cpus[i].node == node)
+			return;
+	}
+	if (zone->ncpus < TSADC_MAX_COOLING_CPUS)
+		zone->cpus[zone->ncpus++].node = node;
+}
+
+static void
+tsadc_thermal_parse_maps(struct tsadc_thermal_zone *zone, phandle_t node,
+    phandle_t trip)
+{
+	pcell_t *cells, ncooling;
+	phandle_t cnode, map, maps, xref;
+	char type[8];
+	int i, len, ncells;
+
+	maps = ofw_bus_find_child(node, "cooling-maps");
+	if (maps <= 0)
+		return;
+	for (map = OF_child(maps); map > 0; map = OF_peer(map)) {
+		if (OF_getencprop(map, "trip", &xref, sizeof(xref)) <= 0 ||
+		    xref != OF_xref_from_node(trip))
+			continue;
+		ncells = OF_getencprop_alloc_multi(map, "cooling-device",
+		    sizeof(*cells), (void **)&cells);
+		if (ncells <= 0)
+			continue;
+		for (i = 0; i < ncells;) {
+			xref = cells[i++];
+			cnode = OF_node_from_xref(xref);
+			if (cnode <= 0 || OF_getencprop(cnode,
+			    "#cooling-cells", &ncooling, sizeof(ncooling)) <= 0 ||
+			    ncooling > (pcell_t)(ncells - i))
+				break;
+			len = OF_getprop(cnode, "device_type", type,
+			    sizeof(type) - 1);
+			if (len > 0) {
+				type[MIN(len, (int)sizeof(type) - 1)] = '\0';
+			}
+			if (ncooling == 2 && len > 0 && strcmp(type, "cpu") == 0)
+				tsadc_thermal_add_cpu(zone, cnode);
+			i += ncooling;
+		}
+		OF_prop_free(cells);
+	}
+}
+
+static void
+tsadc_thermal_parse(struct tsadc_softc *sc, phandle_t sensor_node)
+{
+	struct tsadc_thermal_zone *zone;
+	pcell_t sensor[2], val;
+	phandle_t node, root, trip, trips;
+	char type[16];
+	int len;
+
+	root = OF_finddevice("/thermal-zones");
+	if (root <= 0)
+		return;
+	for (node = OF_child(root); node > 0 &&
+	    sc->nthermal_zones < TSADC_MAX_THERMAL_ZONES;
+	    node = OF_peer(node)) {
+		if (OF_getencprop(node, "thermal-sensors", sensor,
+		    sizeof(sensor)) != sizeof(sensor) ||
+		    sensor[0] != OF_xref_from_node(sensor_node) ||
+		    sensor[1] >= (pcell_t)sc->conf->ntsensors)
+			continue;
+		trips = ofw_bus_find_child(node, "trips");
+		if (trips <= 0)
+			continue;
+		for (trip = OF_child(trips); trip > 0; trip = OF_peer(trip)) {
+			len = OF_getprop(trip, "type", type, sizeof(type) - 1);
+			if (len <= 0)
+				continue;
+			type[MIN(len, (int)sizeof(type) - 1)] = '\0';
+			if (strcmp(type, "passive") == 0)
+				break;
+		}
+		if (trip <= 0)
+			continue;
+
+		zone = &sc->thermal_zones[sc->nthermal_zones];
+		zone->sensor = sensor[1];
+		if (OF_getencprop(trip, "temperature", &val, sizeof(val)) <= 0)
+			continue;
+		zone->trip = val;
+		if (OF_getencprop(trip, "hysteresis", &val, sizeof(val)) <= 0)
+			val = 0;
+		zone->hysteresis = val;
+		if (OF_getencprop(node, "polling-delay-passive", &val,
+		    sizeof(val)) <= 0 || val == 0)
+			val = 100;
+		zone->polling_ms = MAX(10, (int)val);
+		len = OF_getprop(node, "name", zone->name,
+		    sizeof(zone->name) - 1);
+		if (len <= 0)
+			strlcpy(zone->name, "thermal-zone", sizeof(zone->name));
+		else
+			zone->name[MIN(len, (int)sizeof(zone->name) - 1)] = '\0';
+		tsadc_thermal_parse_maps(zone, node, trip);
+		if (zone->ncpus != 0)
+			sc->nthermal_zones++;
+		else
+			memset(zone, 0, sizeof(*zone));
+	}
+}
+
+static int
+tsadc_sysctl_trip_override(SYSCTL_HANDLER_ARGS)
+{
+	struct tsadc_softc *sc;
+	int error, val;
+
+	sc = arg1;
+	val = sc->thermal_trip_override;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 0 && (val < 30000 || val >= sc->shutdown_temp))
+		return (EINVAL);
+	sc->thermal_trip_override = val;
+	if (sc->thermal_started)
+		taskqueue_enqueue(taskqueue_thread, &sc->thermal_task);
+	return (0);
+}
+
 static int
 tsadc_sysctl_temperature(SYSCTL_HANDLER_ARGS)
 {
@@ -1060,6 +1407,24 @@ tsadc_attach(device_t dev)
 	}
 
 	OF_device_register_xref(OF_xref_from_node(node), dev);
+	if (sc->conf == &rk3588_tsadc_conf) {
+		tsadc_thermal_parse(sc, node);
+		if (sc->nthermal_zones != 0) {
+			SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+			    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+			    "passive_trip_override",
+			    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, sc, 0,
+			    tsadc_sysctl_trip_override, "I",
+			    "Passive trip override in millidegrees C; 0 uses DT");
+			TASK_INIT(&sc->thermal_task, 0, tsadc_thermal_task, sc);
+			callout_init(&sc->thermal_callout, 1);
+			sc->thermal_started = true;
+			callout_reset(&sc->thermal_callout, hz,
+			    tsadc_thermal_callout, sc);
+			device_printf(dev, "%d CPU thermal zones enabled\n",
+			    sc->nthermal_zones);
+		}
+	}
 	return (bus_generic_attach(dev));
 
 fail_sysctl:
@@ -1085,8 +1450,17 @@ static int
 tsadc_detach(device_t dev)
 {
 	struct tsadc_softc *sc;
+	int i;
+
 	sc = device_get_softc(dev);
 
+	if (sc->thermal_started) {
+		sc->detaching = true;
+		callout_drain(&sc->thermal_callout);
+		taskqueue_drain(taskqueue_thread, &sc->thermal_task);
+		for (i = 0; i < sc->nthermal_zones; i++)
+			tsadc_thermal_restore_zone(&sc->thermal_zones[i]);
+	}
 	if (sc->irq_ih != NULL)
 		bus_teardown_intr(dev, sc->irq_res, sc->irq_ih);
 	sysctl_ctx_free(&tsadc_sysctl_ctx);
