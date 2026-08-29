@@ -55,6 +55,9 @@
 #define	MCLK_I2S0_8CH_RX		47
 #define	CLK_I2S0_8CH_RX		48
 #define	HCLK_AUDIO_ROOT			52
+#define	PCLK_BUSTIMER0			84
+#define	CLK_BUS_TIMER_ROOT		86
+#define	CLK_BUSTIMER0			87
 #define	ACLK_DMAC0			110
 #define	PCLK_WDT0			99
 #define	TCLK_WDT0			100
@@ -294,6 +297,7 @@ PLIST(mux_200m_150m_24m_p) =
     { "clk_200m_src", "clk_150m_src", "xin24m" };
 PLIST(mux_100m_50m_24m_p) =
     { "clk_100m_src", "clk_50m_src", "xin24m" };
+PLIST(mux_24m_100m_p) = { "xin24m", "clk_100m_src" };
 PLIST(gpll_cpll_dmyaupll_npll_spll_p) =
     { "gpll", "cpll", "dummy_aupll", "npll", "spll" };
 PLIST(gpll_cpll_v0pll_aupll_p) =
@@ -374,6 +378,8 @@ static struct rk_clk rk3588_clks[] = {
 	    RK3588_CLKSEL_CON(128), 13, 2),
 	MUX(0, "pclk_vo1_root_sel", mux_150m_100m_24m_p, 0,
 	    RK3588_CLKSEL_CON(129), 2, 2),
+	MUX(0, "clk_bus_timer_root_sel", mux_24m_100m_p, 0,
+	    RK3588_CLKSEL_CON(60), 2, 1),
 	COMP(0, "clk_hdmitx0_earc_sel", gpll_cpll_p, 0,
 	    RK3588_CLKSEL_CON(133), 1, 5, 6, 1),
 	COMP(0, "clk_hdmitx1_earc_sel", gpll_cpll_p, 0,
@@ -457,6 +463,12 @@ static struct rk_cru_gate rk3588_gates[] = {
 	GATE(DBCLK_GPIO0, "dbclk_gpio0", "xin24m", RK3588_PMU_CLKGATE_CON(5), 6),
 	GATE(PCLK_WDT0, "pclk_wdt0", "pclk_top_root", RK3588_CLKGATE_CON(15), 0),
 	GATE(TCLK_WDT0, "tclk_wdt0", "xin24m", RK3588_CLKGATE_CON(15), 1),
+	GATE(PCLK_BUSTIMER0, "pclk_bustimer0", "pclk_top_root",
+	    RK3588_CLKGATE_CON(15), 12),
+	GATE(CLK_BUS_TIMER_ROOT, "clk_bus_timer_root",
+	    "clk_bus_timer_root_sel", RK3588_CLKGATE_CON(15), 14),
+	GATE(CLK_BUSTIMER0, "clk_bustimer0", "clk_bus_timer_root",
+	    RK3588_CLKGATE_CON(15), 15),
 	GATE(PCLK_OTPC_NS, "pclk_otpc_ns", "pclk_top_root", RK3588_CLKGATE_CON(18), 9),
 	GATE(CLK_OTPC_NS, "clk_otpc_ns", "xin24m", RK3588_CLKGATE_CON(18), 10),
 	GATE(CLK_OTPC_ARB, "clk_otpc_arb", "xin24m", RK3588_CLKGATE_CON(18), 11),

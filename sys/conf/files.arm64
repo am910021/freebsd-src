@@ -684,6 +684,7 @@ arm64/rockchip/rk3588_sdhci_fdt.c		optional fdt sdhci soc_rockchip_rk3588
 arm64/rockchip/rk3588_crypto.c			optional fdt soc_rockchip_rk3588
 arm64/rockchip/rk3588_otp.c			optional fdt soc_rockchip_rk3588
 arm64/rockchip/rk3588_dfi.c			optional fdt soc_rockchip_rk3588
+arm64/rockchip/rk3588_timer.c			optional fdt soc_rockchip_rk3588
 arm64/rockchip/rk3588_hdmi_qp.c		optional fdt rk3588_hdmi_qp soc_rockchip_rk3588
 arm64/rockchip/rk3588_hdptx_phy.c		optional fdt rk3588_hdptx_phy soc_rockchip_rk3588
 arm64/rockchip/rk3588_vop2.c		optional fdt rk3588_vop2 soc_rockchip_rk3588
