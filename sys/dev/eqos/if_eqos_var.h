@@ -37,8 +37,12 @@
 #define	_EQOS_VAR_H
 
 #include <dev/eqos/if_eqos_reg.h>
+#include <netinet/tcp_lro.h>
 
-#define	EQOS_DMA_DESC_COUNT	256
+#define	EQOS_DMA_DESC_COUNT	512
+#define	EQOS_RX_WATCHDOG_TICKS	0xa0
+#define	EQOS_RX_COAL_FRAMES	8
+#define	EQOS_TX_COAL_FRAMES	25
 
 #define	EQOS_RES_MEM		0
 #define	EQOS_RES_IRQ0		1
@@ -56,7 +60,10 @@ struct eqos_dma_desc {
 struct eqos_bufmap {
 	bus_dmamap_t		map;
 	struct mbuf		*mbuf;
+	bus_addr_t		paddr;
 };
+
+struct buf_ring;
 
 struct eqos_ring {
 	bus_dma_tag_t		desc_tag;
@@ -77,18 +84,36 @@ struct eqos_softc {
 	void			*irq_handle;
 #ifdef FDT
 	struct syscon		*grf;
+	struct syscon		*php_grf;
 	int			grf_offset;
+	int			rk3588_gmac_id;
 #endif
 	uint32_t		csr_clock;
 	uint32_t		csr_clock_range;
 	uint32_t		hw_feature[4];
+	bool			dma_reset_done;
+	bool			fixed_link;
 	bool			link_up;
+	bool			lro_initialized;
 	int			tx_watchdog;
+	uint32_t		txpbl;
+	uint32_t		rxpbl;
+	uint32_t		rx_riwt;
+	uint32_t		rx_coal_frames;
+	uint32_t		tx_coal_frames;
+	uint32_t		tx_frames;
+	uint32_t		tx_tso_frames;
+	uint32_t		tx_mss;
+	struct buf_ring		*tx_control_br;
+	struct buf_ring		*tx_data_br;
 
 	struct ifnet		*ifp;
+	struct ifmedia		fixed_ifmedia;
 	device_t		miibus;
+	device_t		mdio;
 	struct mtx		lock;
 	struct callout		callout;
+	struct lro_ctrl		lro;
 
 	struct eqos_ring	tx;
 	struct eqos_ring	rx;

@@ -81,12 +81,104 @@
 #define	EQOS_GMAC_CLK_RX_DL_CFG(val)		(0x7f000000 | val << 8)
 #define	EQOS_GMAC_CLK_TX_DL_CFG(val)		(0x007f0000 | val)
 
+#define	RK3588_GRF_GMAC_CON7			0x031c
+#define	RK3588_GRF_GMAC_CON8			0x0320
+#define	RK3588_GRF_GMAC_CON9			0x0324
+#define	RK3588_PHP_GRF_GMAC_CON0		0x0008
+#define	RK3588_PHP_GRF_CLK_CON1		0x0070
+
+#define	RK3588_GMAC_RXCLK_DLY(id)		(1U << (2 * (id) + 3))
+#define	RK3588_GMAC_TXCLK_DLY(id)		(1U << (2 * (id) + 2))
+#define	RK3588_GMAC_INTF_MASK(id)		(0x7U << ((id) ? 9 : 3))
+#define	RK3588_GMAC_INTF_RGMII(id)		(0x1U << ((id) ? 9 : 3))
+#define	RK3588_GMAC_CLK_SRC_MASK(id)		(1U << ((id) ? 9 : 4))
+#define	RK3588_GMAC_CLK_DIV_MASK(id)		(0x3U << ((id) ? 7 : 2))
+#define	RK3588_GMAC_CLK_DIV(id, val)		((val) << ((id) ? 7 : 2))
+#define	RK3588_HIWORD_UPDATE(mask, val)		(((mask) << 16) | ((val) & (mask)))
+
 #define	WR4(sc, o, v)		bus_write_4(sc->res[EQOS_RES_MEM], (o), (v))
 
 static const struct ofw_compat_data compat_data[] = {
 	{"snps,dwmac-4.20a",	1},
 	{ NULL, 0 }
 };
+
+static int
+eqos_rk3588_init_grf(device_t dev, uint32_t tx_delay, uint32_t rx_delay)
+{
+	struct eqos_softc *sc;
+	phandle_t node;
+	uint32_t delay_mask, delay_value, intf_mask, clock_mask;
+	char clock_in_out[8];
+	int id;
+
+	sc = device_get_softc(dev);
+	node = ofw_bus_get_node(dev);
+	id = sc->rk3588_gmac_id;
+
+	if (syscon_get_by_ofw_property(dev, node, "rockchip,php-grf",
+	    &sc->php_grf) != 0) {
+		device_printf(dev, "cannot get php-grf driver handle\n");
+		return (ENXIO);
+	}
+	if (tx_delay > 0xff || rx_delay > 0xff) {
+		device_printf(dev, "RGMII delay is out of range\n");
+		return (EINVAL);
+	}
+
+	delay_mask = RK3588_GMAC_RXCLK_DLY(id) |
+	    RK3588_GMAC_TXCLK_DLY(id);
+	delay_value = delay_mask;
+	SYSCON_WRITE_4(sc->grf, RK3588_GRF_GMAC_CON7,
+	    RK3588_HIWORD_UPDATE(delay_mask, delay_value));
+	SYSCON_WRITE_4(sc->grf,
+	    id == 0 ? RK3588_GRF_GMAC_CON8 : RK3588_GRF_GMAC_CON9,
+	    RK3588_HIWORD_UPDATE(0xffff, rx_delay << 8 | tx_delay));
+
+	intf_mask = RK3588_GMAC_INTF_MASK(id);
+	SYSCON_WRITE_4(sc->php_grf, RK3588_PHP_GRF_GMAC_CON0,
+	    RK3588_HIWORD_UPDATE(intf_mask, RK3588_GMAC_INTF_RGMII(id)));
+
+	memset(clock_in_out, 0, sizeof(clock_in_out));
+	OF_getprop(node, "clock_in_out", clock_in_out, sizeof(clock_in_out));
+	clock_mask = RK3588_GMAC_CLK_SRC_MASK(id);
+	SYSCON_WRITE_4(sc->php_grf, RK3588_PHP_GRF_CLK_CON1,
+	    RK3588_HIWORD_UPDATE(clock_mask,
+	    strcmp(clock_in_out, "output") == 0 ? clock_mask : 0));
+	return (0);
+}
+
+static int
+eqos_fdt_set_speed(device_t dev, int speed)
+{
+	struct eqos_softc *sc;
+	uint32_t div, mask;
+
+	sc = device_get_softc(dev);
+	if (sc->rk3588_gmac_id < 0)
+		return (0);
+
+	switch (speed) {
+	case IFM_10_T:
+		div = 2;
+		break;
+	case IFM_100_TX:
+		div = 3;
+		break;
+	case IFM_1000_T:
+	case IFM_1000_SX:
+		div = 0;
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	mask = RK3588_GMAC_CLK_DIV_MASK(sc->rk3588_gmac_id);
+	SYSCON_WRITE_4(sc->php_grf, RK3588_PHP_GRF_CLK_CON1,
+	    RK3588_HIWORD_UPDATE(mask,
+	    RK3588_GMAC_CLK_DIV(sc->rk3588_gmac_id, div)));
+	return (0);
+}
 
 
 static int
@@ -149,9 +241,13 @@ eqos_fdt_init(device_t dev)
 	regulator_t eqos_supply;
 	uint32_t rx_delay, tx_delay;
 	uint8_t buffer[16];
-	clk_t stmmaceth, mac_clk_rx, mac_clk_tx, aclk_mac, pclk_mac;
+	clk_t stmmaceth, mac_clk_rx, mac_clk_tx, clk_mac_ref;
+	clk_t aclk_mac, pclk_mac;
 	uint64_t freq;
+	bool reset_asserted;
 	int error;
+
+	sc->rk3588_gmac_id = -1;
 
 	if (OF_hasprop(node, "rockchip,grf") &&
 	    syscon_get_by_ofw_property(dev, node, "rockchip,grf", &sc->grf)) {
@@ -168,21 +264,35 @@ eqos_fdt_init(device_t dev)
 		sc->grf_offset = EQOS_GRF_GMAC1;
 		break;
 	case RK3588GMAC0:	/* RK3588 gmac0 */
+		sc->rk3588_gmac_id = 0;
+		break;
 	case RK3588GMAC1:	/* RK3588 gmac1 */
+		sc->rk3588_gmac_id = 1;
+		break;
 	default:
 		device_printf(dev, "Unknown eqos address\n");
 		return (ENXIO);
+	}
+	if (sc->rk3588_gmac_id >= 0) {
+		sc->txpbl = sc->rxpbl = 8;
+		sc->rx_riwt = EQOS_RX_WATCHDOG_TICKS;
+		sc->rx_coal_frames = EQOS_RX_COAL_FRAMES;
+		sc->tx_coal_frames = EQOS_TX_COAL_FRAMES;
 	}
 
 	if (hwreset_get_by_ofw_idx(dev, node, 0, &eqos_reset)) {
 		device_printf(dev, "cannot get reset\n");
 		return (ENXIO);
 	}
-	hwreset_assert(eqos_reset);
+	error = hwreset_assert(eqos_reset);
+	if (error != 0) {
+		device_printf(dev, "cannot assert reset: %d\n", error);
+		return (error);
+	}
 
 	error = clk_set_assigned(dev, ofw_bus_get_node(dev));
-	if (error != 0) {
-		device_printf(dev, "clk_set_assigned failed\n");
+	if (error != 0 && error != ENOENT) {
+		device_printf(dev, "clk_set_assigned failed: %d\n", error);
 		return (error);
 	}
 
@@ -211,6 +321,8 @@ eqos_fdt_init(device_t dev)
 		device_printf(dev, "could not get mac_clk_tx clock\n");
 		mac_clk_tx = NULL;
 	}
+	if (clk_get_by_ofw_name(dev, 0, "clk_mac_ref", &clk_mac_ref) != 0)
+		clk_mac_ref = NULL;
 
 	if (clk_get_by_ofw_name(dev, 0, "aclk_mac", &aclk_mac) != 0) {
 		device_printf(dev, "could not get aclk_mac clock\n");
@@ -228,6 +340,8 @@ eqos_fdt_init(device_t dev)
 		clk_enable(pclk_mac);
 	if (mac_clk_tx)
 		clk_enable(mac_clk_tx);
+	if (clk_mac_ref)
+		clk_enable(clk_mac_ref);
 
 	sc->csr_clock = 125000000;
 	sc->csr_clock_range = GMAC_MAC_MDIO_ADDRESS_CR_100_150;
@@ -237,13 +351,19 @@ eqos_fdt_init(device_t dev)
 	if (OF_getencprop(node, "rx_delay", &rx_delay, sizeof(rx_delay)) <= 0)
 		rx_delay = 0x10;
 
-	SYSCON_WRITE_4(sc->grf, sc->grf_offset + EQOS_CON0_OFFSET,
-	    EQOS_GMAC_CLK_RX_DL_CFG(rx_delay) |
-	    EQOS_GMAC_CLK_TX_DL_CFG(tx_delay));
-	SYSCON_WRITE_4(sc->grf, sc->grf_offset + EQOS_CON1_OFFSET,
-	    EQOS_GMAC_PHY_INTF_SEL_RGMII |
-	    EQOS_GMAC_RXCLK_DLY_ENABLE |
-	    EQOS_GMAC_TXCLK_DLY_ENABLE);
+	if (sc->rk3588_gmac_id >= 0) {
+		error = eqos_rk3588_init_grf(dev, tx_delay, rx_delay);
+		if (error != 0)
+			return (error);
+	} else {
+		SYSCON_WRITE_4(sc->grf, sc->grf_offset + EQOS_CON0_OFFSET,
+		    EQOS_GMAC_CLK_RX_DL_CFG(rx_delay) |
+		    EQOS_GMAC_CLK_TX_DL_CFG(tx_delay));
+		SYSCON_WRITE_4(sc->grf, sc->grf_offset + EQOS_CON1_OFFSET,
+		    EQOS_GMAC_PHY_INTF_SEL_RGMII |
+		    EQOS_GMAC_RXCLK_DLY_ENABLE |
+		    EQOS_GMAC_TXCLK_DLY_ENABLE);
+	}
 
 	if (!regulator_get_by_ofw_property(dev, 0, "phy-supply",
 	    &eqos_supply)) {
@@ -256,8 +376,19 @@ eqos_fdt_init(device_t dev)
 	if (eqos_phy_reset(dev))
 		return (ENXIO);
 
-	if (eqos_reset)
-		hwreset_deassert(eqos_reset);
+	error = hwreset_deassert(eqos_reset);
+	if (error != 0) {
+		device_printf(dev, "cannot deassert reset: %d\n", error);
+		return (error);
+	}
+	DELAY(5000);
+	reset_asserted = false;
+	error = hwreset_is_asserted(eqos_reset, &reset_asserted);
+	if (error != 0 || reset_asserted) {
+		device_printf(dev, "hardware reset state error=%d asserted=%d\n",
+		    error, reset_asserted);
+		return (error != 0 ? error : EIO);
+	}
 
 	/* set the MAC address if we have OTP data handy */
 	if (!RK_OTP_READ(dev, buffer, 0, sizeof(buffer))) {
@@ -296,6 +427,7 @@ static device_method_t eqos_fdt_methods[] = {
 
 	/* EQOS interface */
 	DEVMETHOD(if_eqos_init,		eqos_fdt_init),
+	DEVMETHOD(if_eqos_set_speed,	eqos_fdt_set_speed),
 
 	DEVMETHOD_END
 };

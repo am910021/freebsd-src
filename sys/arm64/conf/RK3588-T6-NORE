@@ -9,7 +9,7 @@ ident		RK3588_T6_NORE
 # Print the bring-up version immediately after
 # ---<<BOOT>>--- so console-only hangs can be tied to the exact kernel.
 options		BOOT_TAG_SZ=128
-options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2495-early-boot-marker\"
+options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2556-early-boot-marker\"
 
 # Performance profile: assumes copyin/copyout endpoints are Normal memory.
 # Remove this option to retain stock byte copies for 4-byte alignment.
@@ -45,6 +45,9 @@ options		RSS
 # Use the common PL330/xDMA framework instead of the RK3588 read-only monitor.
 device		xdma
 device		pl330
+
+# Expose EQOS MDIO buses for external Ethernet switch modules.
+device		mdio
 
 # Use the in-tree DRM2 core for the initial RK3588 KMS implementation.
 device		drm2

@@ -106,6 +106,10 @@
 #define	CLK_GMAC_125M			310
 #define	CLK_GMAC_50M			311
 #define	ACLK_MMU_PHP			314
+#define	PCLK_GMAC0			344
+#define	PCLK_GMAC1			345
+#define	ACLK_GMAC0			349
+#define	ACLK_GMAC1			350
 #define	ACLK_USB3OTG2			360
 #define	SUSPEND_CLK_USB3OTG2		361
 #define	REF_CLK_USB3OTG2		362
@@ -217,6 +221,8 @@
 #define	SRST_TSADC			87
 #define	SRST_M_I2S0_8CH_TX		42
 #define	SRST_M_I2S0_8CH_RX		43
+#define	SRST_A_GMAC0			291
+#define	SRST_A_GMAC1			292
 #define	SRST_PCIE0_POWER_UP		294
 #define	SRST_PCIE1_POWER_UP		295
 #define	SRST_PCIE2_POWER_UP		296
@@ -388,6 +394,10 @@ static struct rk_clk rk3588_clks[] = {
 	    RK_CLK_COMPOSITE_DIV_HALF, RK3588_CLKSEL_CON(157), 2, 5, 7, 1),
 	COMP(0, "clk_utmi_otg2_sel", mux_150m_50m_24m_p, 0,
 	    RK3588_CLKSEL_CON(84), 8, 4, 12, 2),
+	COMP(0, "clk_gmac_125m_sel", gpll_cpll_p, 0,
+	    RK3588_CLKSEL_CON(83), 8, 7, 15, 1),
+	COMP(0, "clk_gmac_50m_sel", gpll_cpll_p, 0,
+	    RK3588_CLKSEL_CON(84), 0, 7, 7, 1),
 	COMP(0, "aclk_usb_root", gpll_cpll_p, 0,
 	    RK3588_CLKSEL_CON(96), 0, 5, 5, 1),
 	MUX(0, "hclk_usb_root", mux_150m_100m_50m_24m_p, 0,
@@ -534,8 +544,12 @@ static struct rk_cru_gate rk3588_gates[] = {
 	GATE(TMCLK_EMMC, "tmclk_emmc", "xin24m", RK3588_CLKGATE_CON(31), 8),
 
 	GATE(ACLK_MMU_PHP, "aclk_mmu_php", "aclk_php_root", RK3588_CLKGATE_CON(34), 8),
-	GATE(CLK_GMAC_125M, "clk_gmac_125m", "gpll", RK3588_CLKGATE_CON(35), 5),
-	GATE(CLK_GMAC_50M, "clk_gmac_50m", "gpll", RK3588_CLKGATE_CON(35), 6),
+	GATE(PCLK_GMAC0, "pclk_gmac0", "pclk_php_root", RK3588_CLKGATE_CON(32), 3),
+	GATE(PCLK_GMAC1, "pclk_gmac1", "pclk_php_root", RK3588_CLKGATE_CON(32), 4),
+	GATE(ACLK_GMAC0, "aclk_gmac0", "aclk_mmu_php", RK3588_CLKGATE_CON(32), 10),
+	GATE(ACLK_GMAC1, "aclk_gmac1", "aclk_mmu_php", RK3588_CLKGATE_CON(32), 11),
+	GATE(CLK_GMAC_125M, "clk_gmac_125m", "clk_gmac_125m_sel", RK3588_CLKGATE_CON(35), 5),
+	GATE(CLK_GMAC_50M, "clk_gmac_50m", "clk_gmac_50m_sel", RK3588_CLKGATE_CON(35), 6),
 	GATE(ACLK_HDCP1_ROOT, "aclk_hdcp1_root", "aclk_hdcp1_root_sel", RK3588_CLKGATE_CON(59), 0),
 	GATE(HCLK_VO1_ROOT, "hclk_vo1_root", "hclk_vo1_root_sel", RK3588_CLKGATE_CON(59), 2),
 	GATE(PCLK_VO1_ROOT, "pclk_vo1_root", "pclk_vo1_root_sel", RK3588_CLKGATE_CON(59), 4),
@@ -687,6 +701,8 @@ static const struct rk_cru_reset rk3588_resets[] = {
 	{ SRST_P_PCIE2, RK3588_SOFTRST_CON(33), 14 },
 	{ SRST_P_PCIE3, RK3588_SOFTRST_CON(33), 15 },
 	{ SRST_P_PCIE4, RK3588_SOFTRST_CON(34), 0 },
+	{ SRST_A_GMAC0, RK3588_SOFTRST_CON(32), 10 },
+	{ SRST_A_GMAC1, RK3588_SOFTRST_CON(32), 11 },
 	{ SRST_P_PCIE2_PHY0, RK3588_PHP_SOFTRST_CON(0), 5 },
 	{ SRST_REF_PIPE_PHY0, RK3588_SOFTRST_CON(77), 6 },
 	{ SRST_REF_PIPE_PHY1, RK3588_SOFTRST_CON(77), 7 },
