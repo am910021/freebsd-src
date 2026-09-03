@@ -3,13 +3,13 @@
 # Copyright (c) 2026 Fang, Wei-Xiang (Yuri) <am910021@gmail.com>
 
 include		GENERIC
-ident		RK3588_T6_NORE
+ident		RK3588_NORE
 
 # RK3588-DIAG V2305: resolve V0PLL/NPLL through read-only hardware providers.
 # Print the bring-up version immediately after
 # ---<<BOOT>>--- so console-only hangs can be tied to the exact kernel.
 options		BOOT_TAG_SZ=128
-options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2556-early-boot-marker\"
+options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2558-early-boot-marker\"
 
 # Performance profile: assumes copyin/copyout endpoints are Normal memory.
 # Remove this option to retain stock byte copies for 4-byte alignment.
@@ -52,6 +52,6 @@ device		mdio
 # Use the in-tree DRM2 core for the initial RK3588 KMS implementation.
 device		drm2
 
-# The NanoPC-T6 LTS onboard RTL8125 NICs use the external community if_rge
-# module.  Keep base re(4) out so driver ownership remains explicit.
+# RK3588 boards with RTL8125 NICs use the external community if_rge module.
+# Keep base re(4) out so driver ownership remains explicit.
 nodevice	re
