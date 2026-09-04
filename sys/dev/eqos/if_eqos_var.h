@@ -91,6 +91,12 @@ struct eqos_softc {
 	uint32_t		csr_clock;
 	uint32_t		csr_clock_range;
 	uint32_t		hw_feature[4];
+	u_int			max_mtu;
+	u_int			rx_buf_size;
+	struct mbuf		*rx_mbuf_head;
+	struct mbuf		*rx_mbuf_tail;
+	u_int			rx_mbuf_len;
+	bool			rx_mbuf_error;
 	bool			dma_reset_done;
 	bool			fixed_link;
 	bool			link_up;

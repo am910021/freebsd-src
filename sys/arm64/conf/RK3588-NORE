@@ -9,7 +9,7 @@ ident		RK3588_NORE
 # Print the bring-up version immediately after
 # ---<<BOOT>>--- so console-only hangs can be tied to the exact kernel.
 options		BOOT_TAG_SZ=128
-options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2558-early-boot-marker\"
+options		BOOT_TAG=\"---<<BOOT>>---\nRK3588-DIAG-V2569-early-boot-marker\"
 
 # Performance profile: assumes copyin/copyout endpoints are Normal memory.
 # Remove this option to retain stock byte copies for 4-byte alignment.

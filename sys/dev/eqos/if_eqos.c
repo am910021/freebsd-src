@@ -98,9 +98,11 @@
 #define	RX_DESC_SIZE		(RX_DESC_COUNT * DESC_ALIGN)
 #define	RX_NEXT(n)		(((n) + 1) % RX_DESC_COUNT)
 #define	RX_TX_SERVICE_FRAMES	64
+#define	RX_DMA_SIZE(sc)		(((sc)->rx_buf_size - ETHER_ALIGN) & ~7U)
 
 #define	MII_BUSY_RETRY		1000
 #define	WATCHDOG_TIMEOUT_SECS	3
+#define	EQOS_MAX_MTU		9000
 
 #define	EQOS_LOCK(sc)		mtx_lock(&(sc)->lock)
 #define	EQOS_UNLOCK(sc)		mtx_unlock(&(sc)->lock)
@@ -596,11 +598,12 @@ eqos_setup_rxbuf(struct eqos_softc *sc, int index, struct mbuf *m)
 }
 
 static struct mbuf *
-eqos_alloc_mbufcl(struct eqos_softc *sc)
+eqos_alloc_rxbuf(struct eqos_softc *sc)
 {
 	struct mbuf *m;
 
-	if ((m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR)))
+	if ((m = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR,
+	    sc->rx_buf_size)) != NULL)
 		m->m_pkthdr.len = m->m_len = m->m_ext.ext_size;
 	return (m);
 }
@@ -716,6 +719,12 @@ eqos_init_rings(struct eqos_softc *sc)
 	struct eqos_bufmap *bmap;
 	int i;
 
+	if (sc->rx_mbuf_head != NULL)
+		m_freem(sc->rx_mbuf_head);
+	sc->rx_mbuf_head = sc->rx_mbuf_tail = NULL;
+	sc->rx_mbuf_len = 0;
+	sc->rx_mbuf_error = false;
+
 	for (i = 0; i < TX_DESC_COUNT; i++) {
 		bmap = &sc->tx.buf_map[i];
 		if (bmap->mbuf != NULL) {
@@ -810,7 +819,7 @@ eqos_init(void *if_softc)
 	if (sc->rxpbl > 0)
 		val |= sc->rxpbl << GMAC_DMA_CHAN0_TXRX_PBL_SHIFT;
 	val &= ~GMAC_DMA_CHAN0_RX_CONTROL_RBSZ_MASK;
-	val |= (MCLBYTES << GMAC_DMA_CHAN0_RX_CONTROL_RBSZ_SHIFT);
+	val |= (RX_DMA_SIZE(sc) << GMAC_DMA_CHAN0_RX_CONTROL_RBSZ_SHIFT);
 	WR4(sc, GMAC_DMA_CHAN0_RX_WATCHDOG, sc->rx_riwt);
 	val |= GMAC_DMA_CHAN0_RX_CONTROL_START;
 	WR4(sc, GMAC_DMA_CHAN0_RX_CONTROL, val);
@@ -1017,6 +1026,11 @@ eqos_stop(struct eqos_softc *sc)
 	WR4(sc, GMAC_MAC_CONFIGURATION, val);
 
 	eqos_disable_intr(sc);
+	if (sc->rx_mbuf_head != NULL)
+		m_freem(sc->rx_mbuf_head);
+	sc->rx_mbuf_head = sc->rx_mbuf_tail = NULL;
+	sc->rx_mbuf_len = 0;
+	sc->rx_mbuf_error = false;
 
 	EQOS_UNLOCK(sc);
 }
@@ -1025,10 +1039,10 @@ static void
 eqos_rxintr(struct eqos_softc *sc)
 {
 	if_t ifp = sc->ifp;
-	struct mbuf *m;
+	struct mbuf *m, *new_m;
 	bool lro;
 	uint32_t rdes1, rdes3;
-	int error, length, rx_frames;
+	int error, length, rx_frames, seglen;
 
 	lro = sc->lro_initialized &&
 	    (if_getcapenable(ifp) & IFCAP_LRO) != 0;
@@ -1047,47 +1061,93 @@ eqos_rxintr(struct eqos_softc *sc)
 		bus_dmamap_unload(sc->rx.buf_tag,
 		    sc->rx.buf_map[sc->rx.head].map);
 
+		m = sc->rx.buf_map[sc->rx.head].mbuf;
+		sc->rx.buf_map[sc->rx.head].mbuf = NULL;
 		length = rdes3 & EQOS_RDES3_LENGTH_MASK;
-		if (length) {
-			m = sc->rx.buf_map[sc->rx.head].mbuf;
-			m->m_pkthdr.rcvif = ifp;
-			m->m_pkthdr.len = length;
-			m->m_len = length;
-			m->m_nextpkt = NULL;
-			if ((if_getcapenable(ifp) & IFCAP_RXCSUM) != 0 &&
-			    (rdes1 & (EQOS_RDES1_IP_HDR_ERROR |
-			    EQOS_RDES1_IP_CSUM_BYPASSED |
-			    EQOS_RDES1_IP_PAYLOAD_ERROR)) == 0 &&
-			    (rdes1 & (EQOS_RDES1_IPV4_HEADER |
-			    EQOS_RDES1_IPV6_HEADER)) != 0) {
-				m->m_pkthdr.csum_flags = CSUM_DATA_VALID |
-				    CSUM_PSEUDO_HDR;
-				m->m_pkthdr.csum_data = 0xffff;
-				if ((rdes1 & EQOS_RDES1_IPV4_HEADER) != 0)
-					m->m_pkthdr.csum_flags |= CSUM_IP_CHECKED |
-					    CSUM_IP_VALID;
+		if ((rdes3 & EQOS_RDES3_FD) != 0) {
+			if (sc->rx_mbuf_head != NULL) {
+				m_freem(sc->rx_mbuf_head);
+				if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 			}
-
-			/* Remove trailing FCS */
-			m_adj(m, -ETHER_CRC_LEN);
-
-			EQOS_UNLOCK(sc);
-			if (!lro ||
-			    (m->m_pkthdr.csum_flags & (CSUM_DATA_VALID |
-			    CSUM_PSEUDO_HDR)) != (CSUM_DATA_VALID |
-			    CSUM_PSEUDO_HDR) || tcp_lro_rx(&sc->lro, m, 0) != 0)
-				if_input(ifp, m);
-			EQOS_LOCK(sc);
+			sc->rx_mbuf_head = sc->rx_mbuf_tail = m;
+			sc->rx_mbuf_len = 0;
+			sc->rx_mbuf_error = false;
+		} else if (sc->rx_mbuf_head != NULL) {
+			m->m_flags &= ~M_PKTHDR;
+			sc->rx_mbuf_tail->m_next = m;
+			sc->rx_mbuf_tail = m;
+		} else {
+			m_freem(m);
+			m = NULL;
+			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		}
 
-		if ((m = eqos_alloc_mbufcl(sc))) {
-			if ((error = eqos_setup_rxbuf(sc, sc->rx.head, m)))
+		if (m != NULL) {
+			sc->rx_mbuf_error |=
+			    (rdes3 & (EQOS_RDES3_ES | EQOS_RDES3_OE |
+			    EQOS_RDES3_RE)) != 0;
+			seglen = RX_DMA_SIZE(sc);
+			if ((rdes3 & EQOS_RDES3_LD) != 0) {
+				/* The FCS may straddle the final two DMA buffers. */
+				if (length <= sc->rx_mbuf_len ||
+				    length > sc->rx_mbuf_len + seglen) {
+					sc->rx_mbuf_error = true;
+				} else
+					seglen = length - sc->rx_mbuf_len;
+			}
+			m->m_len = seglen;
+			sc->rx_mbuf_len += seglen;
+		}
+
+		if (m != NULL && (rdes3 & EQOS_RDES3_LD) != 0) {
+			m = sc->rx_mbuf_head;
+			sc->rx_mbuf_head = sc->rx_mbuf_tail = NULL;
+			if (sc->rx_mbuf_error) {
+				m_freem(m);
+				if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
+				m = NULL;
+			} else {
+				m->m_pkthdr.rcvif = ifp;
+				m->m_pkthdr.len = sc->rx_mbuf_len;
+				m->m_nextpkt = NULL;
+				if ((if_getcapenable(ifp) & IFCAP_RXCSUM) != 0 &&
+				    (rdes1 & (EQOS_RDES1_IP_HDR_ERROR |
+				    EQOS_RDES1_IP_CSUM_BYPASSED |
+				    EQOS_RDES1_IP_PAYLOAD_ERROR)) == 0 &&
+				    (rdes1 & (EQOS_RDES1_IPV4_HEADER |
+				    EQOS_RDES1_IPV6_HEADER)) != 0) {
+					m->m_pkthdr.csum_flags = CSUM_DATA_VALID |
+					    CSUM_PSEUDO_HDR;
+					m->m_pkthdr.csum_data = 0xffff;
+					if ((rdes1 & EQOS_RDES1_IPV4_HEADER) != 0)
+						m->m_pkthdr.csum_flags |=
+						    CSUM_IP_CHECKED | CSUM_IP_VALID;
+				}
+
+				/* Remove trailing FCS */
+				m_adj(m, -ETHER_CRC_LEN);
+
+				EQOS_UNLOCK(sc);
+				if (!lro ||
+				    (m->m_pkthdr.csum_flags & (CSUM_DATA_VALID |
+				    CSUM_PSEUDO_HDR)) != (CSUM_DATA_VALID |
+				    CSUM_PSEUDO_HDR) ||
+				    tcp_lro_rx(&sc->lro, m, 0) != 0)
+					if_input(ifp, m);
+				EQOS_LOCK(sc);
+				if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+			}
+			sc->rx_mbuf_len = 0;
+			sc->rx_mbuf_error = false;
+		}
+
+		if ((new_m = eqos_alloc_rxbuf(sc))) {
+			if ((error = eqos_setup_rxbuf(sc, sc->rx.head, new_m)))
 				printf("ERROR: Hole in RX ring!!\n");
 		}
-		else
+		else {
 			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
-
-		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+		}
 
 		WR4(sc, GMAC_DMA_CHAN0_RX_END_ADDR,
 		    (uint32_t)sc->rx.desc_ring_paddr + DESC_OFFSET(sc->rx.head));
@@ -1263,6 +1323,13 @@ eqos_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	int error = 0;
 
 	switch (cmd) {
+	case SIOCSIFMTU:
+		if (ifr->ifr_mtu < ETHERMIN || ifr->ifr_mtu > sc->max_mtu)
+			error = EINVAL;
+		else
+			if_setmtu(ifp, ifr->ifr_mtu);
+		break;
+
 	case SIOCSIFFLAGS:
 		if (if_getflags(ifp) & IFF_UP) {
 			if (if_getdrvflags(ifp) & IFF_DRV_RUNNING) {
@@ -1494,8 +1561,8 @@ eqos_setup_dma(struct eqos_softc *sc)
 	if ((error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), 1, 0,
 					BUS_SPACE_MAXADDR_32BIT,
 					BUS_SPACE_MAXADDR, NULL, NULL,
-					MCLBYTES, 1,
-					MCLBYTES, 0, NULL, NULL,
+					sc->rx_buf_size, 1,
+					sc->rx_buf_size, 0, NULL, NULL,
 					&sc->rx.buf_tag))) {
 		device_printf(sc->dev, "could not create RX buf DMA tag.\n");
 		return (error);
@@ -1507,7 +1574,7 @@ eqos_setup_dma(struct eqos_softc *sc)
 			device_printf(sc->dev, "cannot create RX buffer map\n");
 			return (error);
 		}
-		if (!(m = eqos_alloc_mbufcl(sc))) {
+		if (!(m = eqos_alloc_rxbuf(sc))) {
 			device_printf(sc->dev, "cannot allocate RX mbuf\n");
 			return (ENOMEM);
 		}
@@ -1546,6 +1613,13 @@ eqos_attach(device_t dev)
 
 	if ((error = IF_EQOS_INIT(dev)))
 		return (error);
+	if (sc->max_mtu == 0)
+		sc->max_mtu = ETHERMTU;
+	if (sc->max_mtu < ETHERMTU || sc->max_mtu > EQOS_MAX_MTU) {
+		device_printf(dev, "invalid max-frame-size %u\n", sc->max_mtu);
+		return (EINVAL);
+	}
+	sc->rx_buf_size = MCLBYTES;
 
 	sc->dev = dev;
 	ver  = RD4(sc, GMAC_MAC_VERSION);

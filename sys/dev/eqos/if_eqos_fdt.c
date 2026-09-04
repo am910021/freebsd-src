@@ -241,6 +241,7 @@ eqos_fdt_init(device_t dev)
 	regulator_t eqos_supply;
 	uint32_t rx_delay, tx_delay;
 	uint8_t buffer[16];
+	char phy_mode[16];
 	clk_t stmmaceth, mac_clk_rx, mac_clk_tx, clk_mac_ref;
 	clk_t aclk_mac, pclk_mac;
 	uint64_t freq;
@@ -248,6 +249,8 @@ eqos_fdt_init(device_t dev)
 	int error;
 
 	sc->rk3588_gmac_id = -1;
+	OF_getencprop(node, "max-frame-size", &sc->max_mtu,
+	    sizeof(sc->max_mtu));
 
 	if (OF_hasprop(node, "rockchip,grf") &&
 	    syscon_get_by_ofw_property(dev, node, "rockchip,grf", &sc->grf)) {
@@ -352,6 +355,14 @@ eqos_fdt_init(device_t dev)
 		rx_delay = 0x10;
 
 	if (sc->rk3588_gmac_id >= 0) {
+		memset(phy_mode, 0, sizeof(phy_mode));
+		OF_getprop(node, "phy-mode", phy_mode, sizeof(phy_mode));
+		if (strcmp(phy_mode, "rgmii-id") == 0)
+			tx_delay = rx_delay = 0;
+		else if (strcmp(phy_mode, "rgmii-rxid") == 0)
+			rx_delay = 0;
+		else if (strcmp(phy_mode, "rgmii-txid") == 0)
+			tx_delay = 0;
 		error = eqos_rk3588_init_grf(dev, tx_delay, rx_delay);
 		if (error != 0)
 			return (error);
