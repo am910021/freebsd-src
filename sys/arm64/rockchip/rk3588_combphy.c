@@ -39,8 +39,14 @@
 #define	RK3568_PHYREG6				0x14
 #define	 RK3568_PHYREG6_PLL_DIV_MASK		(0x3 << 6)
 #define	 RK3568_PHYREG6_PLL_DIV_2		(0x1 << 6)
+#define	RK3568_PHYREG7				0x18
+#define	 RK3568_PHYREG7_TX_RTERM_50OHM		(0x8 << 4)
+#define	 RK3568_PHYREG7_RX_RTERM_44OHM		0xf
 #define	RK3568_PHYREG8				0x20
 #define	 RK3568_PHYREG8_SSC_EN			(1 << 4)
+#define	RK3588_PHYREG9				0x24
+#define	 RK3588_PHYREG9_SSC_PPM_MASK		0xf
+#define	 RK3588_PHYREG9_SSC_PPM_3500		0x7
 #define	RK3568_PHYREG11				0x28
 #define	 RK3568_PHYREG11_SU_TRIM_0_7		0xf0
 #define	RK3568_PHYREG12				0x2c
@@ -117,6 +123,18 @@ static const struct rk3588_combphy_reg rk3588_combphy_pipe_pcie1l0_sel =
     { 0x0100, 0, 0, 0x01, 0x00 };
 static const struct rk3588_combphy_reg rk3588_combphy_pipe_pcie1l1_sel =
     { 0x0100, 1, 1, 0x01, 0x00 };
+static const struct rk3588_combphy_reg rk3588_combphy_con0_for_sata =
+    { 0x0000, 15, 0, 0x00, 0x0129 };
+static const struct rk3588_combphy_reg rk3588_combphy_con1_for_sata =
+    { 0x0004, 15, 0, 0x00, 0x0000 };
+static const struct rk3588_combphy_reg rk3588_combphy_con2_for_sata =
+    { 0x0008, 15, 0, 0x00, 0x80c1 };
+static const struct rk3588_combphy_reg rk3588_combphy_con3_for_sata =
+    { 0x000c, 15, 0, 0x00, 0x0407 };
+static const struct rk3588_combphy_reg rk3588_combphy_pipe_con0_for_sata =
+    { 0x0000, 11, 5, 0x00, 0x22 };
+static const struct rk3588_combphy_reg rk3588_combphy_pipe_con1_for_sata =
+    { 0x0004, 2, 0, 0x00, 0x02 };
 
 static uint32_t
 rk3588_combphy_mask(uint8_t bitend, uint8_t bitstart)
@@ -262,6 +280,74 @@ rk3588_combphy_config_pcie(struct rk3588_combphy_softc *sc)
 }
 
 static int
+rk3588_combphy_config_sata(struct rk3588_combphy_softc *sc)
+{
+	uint64_t rate;
+	uint32_t reg;
+
+	reg = bus_read_4(sc->mem, RK3568_PHYREG15);
+	bus_write_4(sc->mem, RK3568_PHYREG15,
+	    reg | RK3568_PHYREG15_CTLE_EN);
+	bus_write_4(sc->mem, RK3568_PHYREG7,
+	    RK3568_PHYREG7_TX_RTERM_50OHM |
+	    RK3568_PHYREG7_RX_RTERM_44OHM);
+
+	rk3588_combphy_param_write(sc->pipe_phy_grf,
+	    &rk3588_combphy_con0_for_sata, true);
+	rk3588_combphy_param_write(sc->pipe_phy_grf,
+	    &rk3588_combphy_con1_for_sata, true);
+	rk3588_combphy_param_write(sc->pipe_phy_grf,
+	    &rk3588_combphy_con2_for_sata, true);
+	rk3588_combphy_param_write(sc->pipe_phy_grf,
+	    &rk3588_combphy_con3_for_sata, true);
+	rk3588_combphy_param_write(sc->pipe_grf,
+	    &rk3588_combphy_pipe_con0_for_sata, true);
+	rk3588_combphy_param_write(sc->pipe_grf,
+	    &rk3588_combphy_pipe_con1_for_sata, true);
+
+	rate = rk3588_combphy_ref_rate(sc);
+	switch (rate) {
+	case REF_CLOCK_24MHZ:
+		rk3588_combphy_update(sc, RK3568_PHYREG15,
+		    RK3568_PHYREG15_SSC_CNT_MASK,
+		    RK3568_PHYREG15_SSC_CNT_VALUE);
+		bus_write_4(sc->mem, RK3568_PHYREG16,
+		    RK3568_PHYREG16_SSC_CNT_VALUE);
+		break;
+	case REF_CLOCK_25MHZ:
+		rk3588_combphy_param_write(sc->pipe_phy_grf,
+		    &rk3588_combphy_pipe_clk_25m, true);
+		break;
+	case REF_CLOCK_100MHZ:
+		rk3588_combphy_param_write(sc->pipe_phy_grf,
+		    &rk3588_combphy_pipe_clk_100m, true);
+		rk3588_combphy_update(sc, RK3568_PHYREG32,
+		    RK3568_PHYREG32_SSC_MASK,
+		    RK3568_PHYREG32_SSC_DOWNWARD |
+		    RK3568_PHYREG32_SSC_OFFSET_500PPM);
+		rk3588_combphy_update(sc, RK3588_PHYREG9,
+		    RK3588_PHYREG9_SSC_PPM_MASK,
+		    RK3588_PHYREG9_SSC_PPM_3500);
+		break;
+	default:
+		device_printf(sc->dev, "unsupported ref clock: %ju\n",
+		    (uintmax_t)rate);
+		return (EINVAL);
+	}
+
+	if (sc->ext_refclk)
+		rk3588_combphy_param_write(sc->pipe_phy_grf,
+		    &rk3588_combphy_pipe_clk_ext, true);
+	if (sc->enable_ssc) {
+		reg = bus_read_4(sc->mem, RK3568_PHYREG8);
+		bus_write_4(sc->mem, RK3568_PHYREG8,
+		    reg | RK3568_PHYREG8_SSC_EN);
+	}
+
+	return (0);
+}
+
+static int
 rk3588_combphy_enable(struct phynode *phynode, bool enable)
 {
 	device_t dev;
@@ -278,12 +364,17 @@ rk3588_combphy_enable(struct phynode *phynode, bool enable)
 	if (error != 0)
 		return (error);
 
-	if (sc->mode != PHY_TYPE_PCIE) {
+	switch (sc->mode) {
+	case PHY_TYPE_PCIE:
+		error = rk3588_combphy_config_pcie(sc);
+		break;
+	case PHY_TYPE_SATA:
+		error = rk3588_combphy_config_sata(sc);
+		break;
+	default:
 		device_printf(dev, "unsupported PHY mode %d\n", sc->mode);
 		return (EINVAL);
 	}
-
-	error = rk3588_combphy_config_pcie(sc);
 	if (error != 0)
 		return (error);
 
