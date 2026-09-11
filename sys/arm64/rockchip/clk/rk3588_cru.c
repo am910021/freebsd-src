@@ -196,10 +196,15 @@
 #define	CLK_PCIE_AUX2			337
 #define	CLK_PCIE_AUX3			338
 #define	CLK_PCIE_AUX4			339
+#define	CLK_PIPEPHY0_REF		340
+#define	CLK_PMALIVE0			351
+#define	ACLK_SATA0			354
+#define	CLK_RXOOB0			357
 #define	ACLK_MMU_PCIE			313
 #define	CLK_PIPEPHY0_PIPE_G		364
 #define	CLK_PIPEPHY1_PIPE_G		365
 #define	CLK_PIPEPHY2_PIPE_G		366
+#define	CLK_PIPEPHY0_PIPE_ASIC_G	367
 #define	PCLK_PHP_ROOT			343
 #define	ACLK_PCIE_ROOT			346
 #define	ACLK_PHP_ROOT			347
@@ -394,6 +399,8 @@ static struct rk_clk rk3588_clks[] = {
 	    RK_CLK_COMPOSITE_DIV_HALF, RK3588_CLKSEL_CON(157), 2, 5, 7, 1),
 	COMP(0, "clk_utmi_otg2_sel", mux_150m_50m_24m_p, 0,
 	    RK3588_CLKSEL_CON(84), 8, 4, 12, 2),
+	COMP(0, "clk_rxoob0_c", gpll_cpll_p, 0,
+	    RK3588_CLKSEL_CON(82), 0, 7, 7, 1),
 	COMP(0, "clk_gmac_125m_sel", gpll_cpll_p, 0,
 	    RK3588_CLKSEL_CON(83), 8, 7, 15, 1),
 	COMP(0, "clk_gmac_50m_sel", gpll_cpll_p, 0,
@@ -638,6 +645,10 @@ static struct rk_cru_gate rk3588_gates[] = {
 	GATE(CLK_PCIE_AUX2, "clk_pcie_aux2", "xin24m", RK3588_CLKGATE_CON(34), 3),
 	GATE(CLK_PCIE_AUX3, "clk_pcie_aux3", "xin24m", RK3588_CLKGATE_CON(34), 4),
 	GATE(CLK_PCIE_AUX4, "clk_pcie_aux4", "xin24m", RK3588_CLKGATE_CON(34), 5),
+	GATE(CLK_PIPEPHY0_REF, "clk_pipephy0_ref", "xin24m", RK3588_CLKGATE_CON(37), 0),
+	GATE(CLK_PMALIVE0, "clk_pmalive0", "xin24m", RK3588_CLKGATE_CON(37), 4),
+	GATE(ACLK_SATA0, "aclk_sata0", "aclk_mmu_php", RK3588_CLKGATE_CON(37), 7),
+	GATE(CLK_RXOOB0, "clk_rxoob0", "clk_rxoob0_c", RK3588_CLKGATE_CON(37), 10),
 	GATE(PCLK_PCIE_COMBO_PIPE_PHY0, "pclk_pcie_combo_pipe_phy0", "pclk_top_root", RK3588_PHP_CLKGATE_CON(0), 5),
 	GATE(PCLK_PCIE_COMBO_PIPE_PHY1, "pclk_pcie_combo_pipe_phy1", "pclk_top_root", RK3588_PHP_CLKGATE_CON(0), 6),
 	GATE(PCLK_PCIE_COMBO_PIPE_PHY2, "pclk_pcie_combo_pipe_phy2", "pclk_top_root", RK3588_PHP_CLKGATE_CON(0), 7),
@@ -645,6 +656,7 @@ static struct rk_cru_gate rk3588_gates[] = {
 	GATE(CLK_PIPEPHY0_PIPE_G, "clk_pipephy0_pipe_g", "clk_pipephy0_pipe_i", RK3588_CLKGATE_CON(38), 3),
 	GATE(CLK_PIPEPHY1_PIPE_G, "clk_pipephy1_pipe_g", "clk_pipephy1_pipe_i", RK3588_CLKGATE_CON(38), 4),
 	GATE(CLK_PIPEPHY2_PIPE_G, "clk_pipephy2_pipe_g", "clk_pipephy2_pipe_i", RK3588_CLKGATE_CON(38), 5),
+	GATE(CLK_PIPEPHY0_PIPE_ASIC_G, "clk_pipephy0_pipe_asic_g", "clk_pipephy0_pipe_i", RK3588_CLKGATE_CON(38), 6),
 	GATE(CLK_PCIE4L_PIPE, "clk_pcie4l_pipe", "clk_pipephy0_pipe_g", RK3588_CLKGATE_CON(39), 0),
 	GATE(CLK_PCIE2L_PIPE, "clk_pcie2l_pipe", "clk_pipephy2_pipe_g", RK3588_CLKGATE_CON(39), 1),
 	GATE(CLK_PCIE1L2_PIPE, "clk_pcie1l2_pipe", "clk_pipephy0_pipe_g", RK3588_CLKGATE_CON(38), 13),
